@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use serde::{Deserialize, Serialize};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async_with_config, tungstenite::Message};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio::net::{TcpListener, TcpStream};
-use futures_util::{StreamExt, SinkExt};
+use futures_util::{future::join_all, StreamExt, SinkExt};
 use sha2::{Sha256, Digest};
 
 /// 默认要求的最低客户端版本（可通过环境变量 MINIMUM_CLIENT_VERSION 覆盖）
@@ -13,6 +15,24 @@ const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "2.1.0";
 
 /// 默认监听地址（可通过环境变量 BIND_ADDRESS 覆盖）
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8445";
+
+/// 握手阶段允许客户端占用连接的最长时间
+const WEBSOCKET_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
+/// 首次注册消息的绝对截止时间
+const REGISTRATION_TIMEOUT_SECS: u64 = 15;
+
+/// 单次发送允许等待的最长时间
+const SEND_TIMEOUT_SECS: u64 = 5;
+
+/// 单条 WebSocket 消息的最大大小
+const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+
+/// 单个 WebSocket 帧的最大大小
+const MAX_FRAME_SIZE: usize = 512 * 1024;
+
+/// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 /// 版本过低时提示客户端的下载地址（可通过环境变量 CLIENT_DOWNLOAD_URL 覆盖）
 const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://github.com/pmh1314520/MCTier/releases";
@@ -501,7 +521,7 @@ struct ClientInfo {
     virtual_ip: Option<String>,
     virtual_domain: Option<String>,
     use_domain: Option<bool>,
-    sender: Arc<RwLock<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>>,
+    sender: ClientSender,
 }
 
 /// 大厅信息
@@ -531,6 +551,82 @@ type Lobbies = Arc<RwLock<HashMap<String, LobbyInfo>>>;
 
 /// 客户端ID到大厅ID的映射
 type ClientLobbyMap = Arc<RwLock<HashMap<String, String>>>;
+
+type ClientSender = Arc<RwLock<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>>;
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_MESSAGE_SIZE),
+        max_frame_size: Some(MAX_FRAME_SIZE),
+        ..WebSocketConfig::default()
+    }
+}
+
+fn connection_limit_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
+fn max_connections() -> usize {
+    connection_limit_from_env(std::env::var("MAX_CONNECTIONS").ok().as_deref())
+}
+
+async fn send_with_timeout<F, E>(send: F) -> bool
+where
+    F: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+        send,
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            log::debug!("发送 WebSocket 消息失败: {}", error);
+            false
+        }
+        Err(_) => {
+            log::warn!("发送 WebSocket 消息超时（{} 秒）", SEND_TIMEOUT_SECS);
+            false
+        }
+    }
+}
+
+async fn send_message(sender: &ClientSender, message: Message) -> bool {
+    send_with_timeout(async {
+        let mut sender = sender.write().await;
+        sender.send(message).await
+    })
+    .await
+}
+
+async fn send_text(sender: &ClientSender, text: String) -> bool {
+    send_message(sender, Message::Text(text)).await
+}
+
+async fn send_to_lobby_client(
+    lobbies: &Lobbies,
+    lobby_id: &str,
+    client_id: &str,
+    message: Message,
+) -> bool {
+    let sender = {
+        let lobbies_read = lobbies.read().await;
+        lobbies_read
+            .get(lobby_id)
+            .and_then(|lobby| lobby.clients.get(client_id))
+            .map(|client| Arc::clone(&client.sender))
+    };
+
+    match sender {
+        Some(sender) => send_message(&sender, message).await,
+        None => false,
+    }
+}
 
 /// 生成大厅ID（基于大厅名称和密码的哈希）
 fn generate_lobby_id(lobby_name: &str, password: &str) -> String {
@@ -581,6 +677,9 @@ async fn main() {
     log::info!("版本: {} (大厅隔离 - 仅 WebSocket)", env!("CARGO_PKG_VERSION"));
     log::info!("监听地址: {} (WebSocket Only)", listen_addr);
     log::info!("最低客户端版本: {}", minimum_client_version());
+    let max_connections = max_connections();
+    log::info!("最大并发连接数: {}", max_connections);
+    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -603,11 +702,20 @@ async fn main() {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 log::info!("新客户端连接: {}", addr);
+
+                let connection_permit = match Arc::clone(&connection_semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        log::warn!("连接数已达上限（{}），拒绝客户端: {}", max_connections, addr);
+                        continue;
+                    }
+                };
                 
                 let lobbies_clone = Arc::clone(&lobbies);
                 let client_lobby_map_clone = Arc::clone(&client_lobby_map);
                 
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     if let Err(e) = handle_connection(stream, addr, lobbies_clone, client_lobby_map_clone).await {
                         log::error!("处理客户端连接失败 ({}): {}", addr, e);
                     }
@@ -628,8 +736,38 @@ async fn handle_connection(
     lobbies: Lobbies,
     client_lobby_map: ClientLobbyMap,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    handle_connection_with_timeouts(
+        stream,
+        addr,
+        lobbies,
+        client_lobby_map,
+        tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
+        tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn handle_connection_with_timeouts(
+    stream: TcpStream,
+    addr: SocketAddr,
+    lobbies: Lobbies,
+    client_lobby_map: ClientLobbyMap,
+    handshake_timeout: tokio::time::Duration,
+    registration_timeout: tokio::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 升级到 WebSocket
-    let ws_stream = accept_async(stream).await?;
+    let ws_stream = match tokio::time::timeout(
+        handshake_timeout,
+        accept_async_with_config(stream, Some(websocket_config())),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            log::warn!("WebSocket 握手超时（{} 毫秒）: {}", handshake_timeout.as_millis(), addr);
+            return Ok(());
+        }
+    };
     
     log::info!("✅ WebSocket 连接已建立: {}", addr);
     
@@ -641,9 +779,27 @@ async fn handle_connection(
     
     // 标记是否已注册
     let mut is_registered = false;
+    let registration_deadline = tokio::time::Instant::now()
+        + registration_timeout;
     
     // 处理消息
-    while let Some(msg_result) = read.next().await {
+    loop {
+        let msg_result = if is_registered {
+            match read.next().await {
+                Some(msg_result) => msg_result,
+                None => break,
+            }
+        } else {
+            match tokio::time::timeout_at(registration_deadline, read.next()).await {
+                Ok(Some(msg_result)) => msg_result,
+                Ok(None) => break,
+                Err(_) => {
+                    log::warn!("客户端首次注册超时（{} 毫秒）: {}", registration_timeout.as_millis(), addr);
+                    break;
+                }
+            }
+        };
+
         match msg_result {
             Ok(msg) => {
                 if msg.is_text() {
@@ -684,7 +840,7 @@ async fn handle_connection(
                                             download_url: client_download_url().to_string(),
                                         };
                                         if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                            send_text(&write, json).await;
                                         }
                                         // 等待一小段时间确保消息发送，然后强制关闭连接
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -697,7 +853,7 @@ async fn handle_connection(
                                             message: "clientId 不能为空".to_string(),
                                         };
                                         if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                            send_text(&write, json).await;
                                         }
                                         continue;
                                     }
@@ -732,8 +888,9 @@ async fn handle_connection(
                                         let error_msg = SignalingMessage::RegisterError {
                                             message: "客户端身份已在使用中，请重新连接".to_string(),
                                         };
+                                        drop(lobbies_write);
                                         if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                            send_text(&write, json).await;
                                         }
                                         // Close the duplicate session so reconnecting clients can
                                         // retry after the previous connection finishes cleanup.
@@ -758,11 +915,12 @@ async fn handle_connection(
                                     // 验证密码
                                     if lobby.password_hash != password_hash {
                                         log::warn!("❌ 密码错误: {} 尝试加入大厅 {}", player_name, lobby_name);
+                                        drop(lobbies_write);
                                         let error_msg = SignalingMessage::RegisterError {
                                             message: "密码错误".to_string(),
                                         };
                                         if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                            send_text(&write, json).await;
                                         }
                                         continue;
                                     }
@@ -771,11 +929,12 @@ async fn handle_connection(
                                     if let Some(max) = lobby.max_players {
                                         if !lobby.clients.contains_key(&cid) && lobby.clients.len() as u32 >= max {
                                             log::warn!("❌ 大厅 {} 已满（{}/{}），拒绝 {}", lobby_name, lobby.clients.len(), max, player_name);
+                                            drop(lobbies_write);
                                             let error_msg = SignalingMessage::RegisterError {
                                                 message: format!("大厅人数已满（上限 {} 人）", max),
                                             };
                                             if let Ok(json) = serde_json::to_string(&error_msg) {
-                                                let _ = write.write().await.send(Message::Text(json)).await;
+                                                send_text(&write, json).await;
                                             }
                                             continue;
                                         }
@@ -807,30 +966,34 @@ async fn handle_connection(
                                         muted_players: Some(muted_now),
                                     };
                                     if let Ok(json) = serde_json::to_string(&success_msg) {
-                                        let _ = write.write().await.send(Message::Text(json)).await;
+                                        send_text(&write, json).await;
                                     }
                                     
                                     // 发送当前大厅内的玩家列表
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        let players: Vec<PlayerInfo> = lobby.clients
-                                            .iter()
-                                            .filter(|(id, _)| **id != cid)
-                                            .map(|(_, info)| PlayerInfo {
-                                                player_id: info.player_id.clone(),
-                                                player_name: info.player_name.clone(),
-                                                virtual_ip: info.virtual_ip.clone(),
-                                                virtual_domain: info.virtual_domain.clone(),
-                                                use_domain: info.use_domain,
+                                    let players = {
+                                        let lobbies_read = lobbies.read().await;
+                                        lobbies_read
+                                            .get(&lid)
+                                            .map(|lobby| {
+                                                lobby
+                                                    .clients
+                                                    .iter()
+                                                    .filter(|(id, _)| **id != cid)
+                                                    .map(|(_, info)| PlayerInfo {
+                                                        player_id: info.player_id.clone(),
+                                                        player_name: info.player_name.clone(),
+                                                        virtual_ip: info.virtual_ip.clone(),
+                                                        virtual_domain: info.virtual_domain.clone(),
+                                                        use_domain: info.use_domain,
+                                                    })
+                                                    .collect::<Vec<_>>()
                                             })
-                                            .collect();
-                                        
-                                        let players_list = SignalingMessage::PlayersList { players };
-                                        if let Ok(json) = serde_json::to_string(&players_list) {
-                                            let _ = write.write().await.send(Message::Text(json)).await;
-                                        }
+                                            .unwrap_or_default()
+                                    };
+                                    let players_list = SignalingMessage::PlayersList { players };
+                                    if let Ok(json) = serde_json::to_string(&players_list) {
+                                        send_text(&write, json).await;
                                     }
-                                    drop(lobbies_read);
                                     
                                     // 通知大厅内其他客户端有新玩家加入
                                     broadcast_to_lobby(
@@ -865,27 +1028,25 @@ async fn handle_connection(
                                     };
                                     
                                     // 获取发送者名称
-                                    let lobbies_read = lobbies.read().await;
-                                    let player_name = lobbies_read
-                                        .get(&lid)
-                                        .and_then(|lobby| lobby.clients.get(&from))
-                                        .map(|info| info.player_name.clone());
-                                    
+                                    let player_name = {
+                                        let lobbies_read = lobbies.read().await;
+                                        lobbies_read
+                                            .get(&lid)
+                                            .and_then(|lobby| lobby.clients.get(&from))
+                                            .map(|info| info.player_name.clone())
+                                    };
+
                                     // 转发到目标客户端（必须在同一大厅）
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::Offer {
-                                                from,
-                                                to,
-                                                offer,
-                                                player_name,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::Offer {
+                                        from,
+                                        to,
+                                        offer,
+                                        player_name,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -908,16 +1069,11 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::Answer { from, to, answer };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::Answer { from, to, answer };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -940,16 +1096,11 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::IceCandidate { from, to, candidate };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::IceCandidate { from, to, candidate };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1056,16 +1207,14 @@ async fn handle_connection(
                                         Some(id) => id.clone(),
                                         None => continue,
                                     };
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareRelay {
-                                                from, to, share_id, action, player_name, password,
-                                                upstream_id, downstream_id, route_version,
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareRelay {
+                                        from, to, share_id, action, player_name, password,
+                                        upstream_id, downstream_id, route_version,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1092,24 +1241,19 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareOffer {
-                                                from,
-                                                to,
-                                                share_id,
-                                                player_name,
-                                                password,
-                                                route_version,
-                                                offer,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareOffer {
+                                        from,
+                                        to,
+                                        share_id,
+                                        player_name,
+                                        password,
+                                        route_version,
+                                        offer,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1136,22 +1280,17 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareAnswer {
-                                                from,
-                                                to,
-                                                share_id,
-                                                route_version,
-                                                answer,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareAnswer {
+                                        from,
+                                        to,
+                                        share_id,
+                                        route_version,
+                                        answer,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1178,23 +1317,18 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareIceCandidate {
-                                                from,
-                                                to,
-                                                share_id,
-                                                connection_role,
-                                                route_version,
-                                                candidate,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareIceCandidate {
+                                        from,
+                                        to,
+                                        share_id,
+                                        connection_role,
+                                        route_version,
+                                        candidate,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1217,21 +1351,16 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareError {
-                                                from,
-                                                to,
-                                                share_id,
-                                                error,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareError {
+                                        from,
+                                        to,
+                                        share_id,
+                                        error,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1283,22 +1412,17 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::ScreenShareListResponse {
-                                                from,
-                                                to,
-                                                share_id,
-                                                player_name,
-                                                has_password,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::ScreenShareListResponse {
+                                        from,
+                                        to,
+                                        share_id,
+                                        player_name,
+                                        has_password,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1480,20 +1604,15 @@ async fn handle_connection(
                                     };
                                     
                                     // 转发到目标客户端（必须在同一大厅）
-                                    let lobbies_read = lobbies.read().await;
-                                    if let Some(lobby) = lobbies_read.get(&lid) {
-                                        if let Some(target) = lobby.clients.get(&to) {
-                                            let forward_msg = SignalingMessage::FileShareListResponse {
-                                                from,
-                                                to,
-                                                shares,
-                                            };
-                                            
-                                            if let Ok(json) = serde_json::to_string(&forward_msg) {
-                                                let _ = target.sender.write().await.send(Message::Text(json)).await;
-                                            }
-                                        } else {
-                                            log::warn!("目标客户端不在同一大厅: {}", to);
+                                    let target_id = to.clone();
+                                    let forward_msg = SignalingMessage::FileShareListResponse {
+                                        from,
+                                        to,
+                                        shares,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&forward_msg) {
+                                        if !send_to_lobby_client(&lobbies, &lid, &target_id, Message::Text(json)).await {
+                                            log::warn!("目标客户端不在同一大厅或发送失败: {}", target_id);
                                         }
                                     }
                                 }
@@ -1503,7 +1622,7 @@ async fn handle_connection(
                                     // 客户端使用应用层 {type:"ping"}，服务器必须回 {type:"pong"}，
                                     // 否则客户端会因 5 秒收不到 pong 而误判断线并不断重连。
                                     if let Ok(json) = serde_json::to_string(&SignalingMessage::Pong) {
-                                        let _ = write.write().await.send(Message::Text(json)).await;
+                                        send_text(&write, json).await;
                                     }
                                 }
                                 SignalingMessage::Pong => {
@@ -1535,7 +1654,7 @@ async fn handle_connection(
                                     drop(lobbies_read);
                                     let resp = SignalingMessage::PublicLobbyListResponse { lobbies: public_list };
                                     if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = write.write().await.send(Message::Text(json)).await;
+                                        send_text(&write, json).await;
                                     }
                                 }
                                 SignalingMessage::KickPlayer { from, target } => {
@@ -1570,7 +1689,7 @@ async fn handle_connection(
                                     if let Some(sender) = target_sender {
                                         let kicked = SignalingMessage::Kicked { reason: "你已被房主移出大厅".to_string() };
                                         if let Ok(json) = serde_json::to_string(&kicked) {
-                                            let _ = sender.write().await.send(Message::Text(json)).await;
+                                            send_text(&sender, json).await;
                                         }
                                     }
                                     // 从大厅移除目标
@@ -1616,15 +1735,12 @@ async fn handle_connection(
                                     }
                                     log::info!("🔇 房主 {} 设置 {} 禁言={}", from, target, muted);
                                     // 广播禁言状态给所有人（含目标本人）
-                                    let msg = SignalingMessage::PlayerMuteChanged { player_id: target.clone(), muted };
-                                    if let Ok(json) = serde_json::to_string(&msg) {
-                                        let lobbies_read = lobbies.read().await;
-                                        if let Some(lobby) = lobbies_read.get(&lid) {
-                                            for client in lobby.clients.values() {
-                                                let _ = client.sender.write().await.send(Message::Text(json.clone())).await;
-                                            }
-                                        }
-                                    }
+                                    broadcast_to_lobby(
+                                        &lobbies,
+                                        &lid,
+                                        "",
+                                        SignalingMessage::PlayerMuteChanged { player_id: target, muted },
+                                    ).await;
                                 }
                                 SignalingMessage::TransferHost { from, target } => {
                                     if !is_registered {
@@ -1651,15 +1767,12 @@ async fn handle_connection(
                                     }
                                     if let Some(host_id) = new_host {
                                         log::info!("👑 房主从 {} 转让给 {}", from, host_id);
-                                        let msg = SignalingMessage::HostChanged { host_id };
-                                        if let Ok(json) = serde_json::to_string(&msg) {
-                                            let lobbies_read = lobbies.read().await;
-                                            if let Some(lobby) = lobbies_read.get(&lid) {
-                                                for client in lobby.clients.values() {
-                                                    let _ = client.sender.write().await.send(Message::Text(json.clone())).await;
-                                                }
-                                            }
-                                        }
+                                        broadcast_to_lobby(
+                                            &lobbies,
+                                            &lid,
+                                            "",
+                                            SignalingMessage::HostChanged { host_id },
+                                        ).await;
                                     }
                                 }
                                 SignalingMessage::SetLobbyOptions { from, max_players, is_public, description, password, server_node } => {
@@ -1708,15 +1821,12 @@ async fn handle_connection(
                                     }
                                     if let Some((mp, pubf)) = changed {
                                         log::info!("⚙️ 房主 {} 更新大厅选项: max={:?}, public={}", from, mp, pubf);
-                                        let msg = SignalingMessage::LobbyOptionsChanged { max_players: mp, is_public: pubf };
-                                        if let Ok(json) = serde_json::to_string(&msg) {
-                                            let lobbies_read = lobbies.read().await;
-                                            if let Some(lobby) = lobbies_read.get(&lid) {
-                                                for client in lobby.clients.values() {
-                                                    let _ = client.sender.write().await.send(Message::Text(json.clone())).await;
-                                                }
-                                            }
-                                        }
+                                        broadcast_to_lobby(
+                                            &lobbies,
+                                            &lid,
+                                            "",
+                                            SignalingMessage::LobbyOptionsChanged { max_players: mp, is_public: pubf },
+                                        ).await;
                                     }
                                 }
                                 SignalingMessage::Forward => {
@@ -1746,14 +1856,25 @@ async fn handle_connection(
                                                 };
                                                 
                                                 // 广播给大厅内所有其他客户端
-                                                let lobbies_read = lobbies.read().await;
-                                                if let Some(lobby) = lobbies_read.get(&lid) {
-                                                    for (id, client) in lobby.clients.iter() {
-                                                        if id != from {
-                                                            let _ = client.sender.write().await.send(Message::Text(text.to_string())).await;
-                                                        }
-                                                    }
-                                                }
+                                                let senders = {
+                                                    let lobbies_read = lobbies.read().await;
+                                                    lobbies_read
+                                                        .get(&lid)
+                                                        .map(|lobby| {
+                                                            lobby
+                                                                .clients
+                                                                .iter()
+                                                                .filter(|(id, _)| id.as_str() != from)
+                                                                .map(|(_, client)| Arc::clone(&client.sender))
+                                                                .collect::<Vec<_>>()
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
+                                                let sends = senders.into_iter().map(|sender| {
+                                                    let text = text.to_string();
+                                                    async move { send_text(&sender, text).await }
+                                                });
+                                                let _ = join_all(sends).await;
                                                 continue;
                                             }
                                         }
@@ -1775,13 +1896,8 @@ async fn handle_connection(
                                             };
                                             
                                             // 转发到目标客户端（必须在同一大厅）
-                                            let lobbies_read = lobbies.read().await;
-                                            if let Some(lobby) = lobbies_read.get(&lid) {
-                                                if let Some(target) = lobby.clients.get(to) {
-                                                    let _ = target.sender.write().await.send(Message::Text(text.to_string())).await;
-                                                } else {
-                                                    log::warn!("目标客户端不在同一大厅: {}", to);
-                                                }
+                                            if !send_to_lobby_client(&lobbies, &lid, to, Message::Text(text.to_string())).await {
+                                                log::warn!("目标客户端不在同一大厅或发送失败: {}", to);
                                             }
                                         }
                                     }
@@ -1804,7 +1920,7 @@ async fn handle_connection(
                                     message: format!("您的客户端版本过低，不支持大厅隔离功能。请访问 {} 下载最新版本。", client_download_url()),
                                 };
                                 if let Ok(json) = serde_json::to_string(&error_response) {
-                                    let _ = write.write().await.send(Message::Text(json)).await;
+                                    send_text(&write, json).await;
                                 }
                                 
                                 // 等待消息发送后强制断开连接
@@ -1920,31 +2036,263 @@ async fn broadcast_to_lobby(
     message: SignalingMessage,
 ) {
     if let Ok(json) = serde_json::to_string(&message) {
-        let lobbies_read = lobbies.read().await;
-        if let Some(lobby) = lobbies_read.get(lobby_id) {
-            for (id, client) in lobby.clients.iter() {
-                if id != exclude_id {
-                    let _ = client.sender.write().await.send(Message::Text(json.clone())).await;
-                }
-            }
-        }
+        let senders = {
+            let lobbies_read = lobbies.read().await;
+            lobbies_read
+                .get(lobby_id)
+                .map(|lobby| {
+                    lobby
+                        .clients
+                        .iter()
+                        .filter(|(id, _)| id.as_str() != exclude_id)
+                        .map(|(_, client)| Arc::clone(&client.sender))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        // 只在锁内复制发送端句柄；实际网络写入全部在锁外执行。
+        let sends = senders.into_iter().map(|sender| {
+            let message = Message::Text(json.clone());
+            async move { send_message(&sender, message).await }
+        });
+        let _ = join_all(sends).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_connection, ClientLobbyMap, Lobbies, SignalingMessage};
-    use futures_util::{SinkExt, StreamExt};
+    use super::*;
+    use std::future::pending;
     use serde_json::Value;
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::net::TcpListener;
-    use tokio::sync::RwLock;
     use tokio::time::{timeout, Duration};
-    use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_tungstenite::WebSocketStream;
 
+    #[test]
+    fn websocket_limits_are_explicit() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(2 * 1024 * 1024));
+        assert_eq!(config.max_frame_size, Some(512 * 1024));
+    }
+
+    #[test]
+    fn connection_limit_defaults_and_rejects_invalid_values() {
+        assert_eq!(connection_limit_from_env(None), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(connection_limit_from_env(Some("0")), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(connection_limit_from_env(Some("not-a-number")), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(connection_limit_from_env(Some("7")), 7);
+    }
+
+    #[tokio::test]
+    async fn slow_send_times_out_after_five_seconds() {
+        let send = tokio::spawn(send_with_timeout(pending::<Result<(), &'static str>>()));
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished());
+        tokio::time::sleep(tokio::time::Duration::from_secs(SEND_TIMEOUT_SECS)).await;
+        assert!(!send.await.expect("send timeout task should finish"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_does_not_hold_lobby_lock_while_sender_is_busy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let client_connect = tokio::spawn(TcpStream::connect(address));
+        let (server_stream, _) = listener.accept().await.expect("accept test connection");
+        let _client_stream = client_connect
+            .await
+            .expect("connect task should finish")
+            .expect("connect test client");
+        let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_stream,
+            Role::Server,
+            Some(websocket_config()),
+        )
+        .await;
+        let (sink, _read) = ws_stream.split();
+        let sender = Arc::new(RwLock::new(sink));
+        let _busy_sender = sender.write().await;
+
+        let mut clients = HashMap::new();
+        clients.insert(
+            "slow".to_string(),
+            ClientInfo {
+                player_id: "slow".to_string(),
+                player_name: "slow".to_string(),
+                virtual_ip: None,
+                virtual_domain: None,
+                use_domain: None,
+                sender: Arc::clone(&sender),
+            },
+        );
+        let mut lobby_map = HashMap::new();
+        lobby_map.insert(
+            "lobby".to_string(),
+            LobbyInfo {
+                lobby_name: "lobby".to_string(),
+                password_hash: String::new(),
+                clients,
+                host_id: "slow".to_string(),
+                max_players: None,
+                is_public: false,
+                description: String::new(),
+                public_password: String::new(),
+                server_node: String::new(),
+                muted: std::collections::HashSet::new(),
+            },
+        );
+        let lobbies = Arc::new(RwLock::new(lobby_map));
+        let lock_acquired = tokio::select! {
+            lock = lobbies.write() => Some(lock),
+            _ = broadcast_to_lobby(
+                &lobbies,
+                "lobby",
+                "",
+                SignalingMessage::PlayerLeft {
+                    player_id: "other".to_string(),
+                },
+            ) => None,
+        };
+        assert!(lock_acquired.is_some(), "broadcast should release lobbies lock before send");
+    }
+
+    async fn start_connection_server(
+        registration_timeout: tokio::time::Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let lobbies = Arc::new(RwLock::new(HashMap::new()));
+        let client_lobby_map = Arc::new(RwLock::new(HashMap::new()));
+        let server_task = tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.expect("accept test client");
+            handle_connection_with_timeouts(
+                stream,
+                addr,
+                lobbies,
+                client_lobby_map,
+                tokio::time::Duration::from_secs(1),
+                registration_timeout,
+            )
+            .await
+            .expect("test server connection should finish cleanly");
+        });
+        (address, server_task)
+    }
+
+    #[tokio::test]
+    async fn websocket_client_can_register_before_deadline() {
+        let (address, server_task) =
+            start_connection_server(tokio::time::Duration::from_secs(1)).await;
+        let (mut client, _) = connect_async(format!("ws://{}", address))
+            .await
+            .expect("WebSocket handshake should succeed");
+        let register = SignalingMessage::Register {
+            client_id: "test-client".to_string(),
+            player_name: "Test Player".to_string(),
+            virtual_ip: None,
+            virtual_domain: None,
+            use_domain: None,
+            lobby_name: "test-lobby".to_string(),
+            lobby_password: "test-password".to_string(),
+            client_version: Some("2.1.0".to_string()),
+        };
+        client
+            .send(Message::Text(
+                serde_json::to_string(&register).expect("register should serialize"),
+            ))
+            .await
+            .expect("register should send");
+
+        let register_success = client
+            .next()
+            .await
+            .expect("register-success should arrive")
+            .expect("register-success should be valid WebSocket message");
+        let players_list = client
+            .next()
+            .await
+            .expect("players-list should arrive")
+            .expect("players-list should be valid WebSocket message");
+        assert!(matches!(
+            serde_json::from_str::<SignalingMessage>(register_success.to_text().expect("text response"))
+                .expect("register-success should parse"),
+            SignalingMessage::RegisterSuccess { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SignalingMessage>(players_list.to_text().expect("text response"))
+                .expect("players-list should parse"),
+            SignalingMessage::PlayersList { .. }
+        ));
+
+        client.close(None).await.expect("client close should send");
+        server_task.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn unregistered_connection_closes_at_absolute_deadline() {
+        let (address, server_task) =
+            start_connection_server(tokio::time::Duration::from_millis(100)).await;
+        let (mut client, _) = connect_async(format!("ws://{}", address))
+            .await
+            .expect("WebSocket handshake should succeed");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        client
+            .send(Message::Text(
+                serde_json::to_string(&SignalingMessage::Ping).expect("ping should serialize"),
+            ))
+            .await
+            .expect("ping should send");
+        let pong = client
+            .next()
+            .await
+            .expect("pong should arrive before deadline")
+            .expect("pong should be valid WebSocket message");
+        assert!(matches!(
+            serde_json::from_str::<SignalingMessage>(pong.to_text().expect("text response"))
+                .expect("pong should parse"),
+            SignalingMessage::Pong
+        ));
+
+        let closed = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            client.next(),
+        )
+        .await
+        .expect("unregistered connection should close by deadline");
+        assert!(closed.is_none() || matches!(closed, Some(Err(_))));
+        server_task.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_rejected_by_websocket_limits() {
+        let (server_io, client_io) = tokio::io::duplex(4 * 1024 * 1024);
+        let (mut server, mut client) = tokio::join!(
+            tokio_tungstenite::WebSocketStream::from_raw_socket(
+                server_io,
+                Role::Server,
+                Some(websocket_config()),
+            ),
+            tokio_tungstenite::WebSocketStream::from_raw_socket(
+                client_io,
+                Role::Client,
+                Some(WebSocketConfig {
+                    max_message_size: Some(4 * 1024 * 1024),
+                    max_frame_size: Some(4 * 1024 * 1024),
+                    ..WebSocketConfig::default()
+                }),
+            ),
+        );
+        let server_read = tokio::spawn(async move { server.next().await });
+        client
+            .send(Message::Text("x".repeat(MAX_MESSAGE_SIZE + 1)))
+            .await
+            .expect("client should send test frame");
+        let server_result = server_read.await.expect("server reader should finish");
+        assert!(matches!(server_result, Some(Err(_))), "oversized message should be rejected");
+    }
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
