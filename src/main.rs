@@ -384,6 +384,48 @@ pub enum SignalingMessage {
     Forward,
 }
 
+impl SignalingMessage {
+    /// Return the identity claimed by a client-originated message.
+    ///
+    /// The WebSocket connection is the authentication boundary. Callers must
+    /// compare this value with the id registered on that same connection before
+    /// routing or authorizing the message.
+    fn claimed_sender(&self, raw: &str) -> Option<String> {
+        match self {
+            Self::Offer { from, .. }
+            | Self::Answer { from, .. }
+            | Self::IceCandidate { from, .. }
+            | Self::ChatMessage { from, .. }
+            | Self::ScreenShareStart { from, .. }
+            | Self::ScreenShareStop { from, .. }
+            | Self::ScreenShareRelay { from, .. }
+            | Self::ScreenShareOffer { from, .. }
+            | Self::ScreenShareAnswer { from, .. }
+            | Self::ScreenShareIceCandidate { from, .. }
+            | Self::ScreenShareError { from, .. }
+            | Self::ScreenShareListRequest { from }
+            | Self::ScreenShareListResponse { from, .. }
+            | Self::ScreenShareViewerLeft { from, .. }
+            | Self::ScreenShareUpdate { from, .. }
+            | Self::FileShareAdded { from, .. }
+            | Self::FileShareRemoved { from, .. }
+            | Self::FileShareListRequest { from }
+            | Self::FileShareListResponse { from, .. }
+            | Self::KickPlayer { from, .. }
+            | Self::MutePlayer { from, .. }
+            | Self::TransferHost { from, .. }
+            | Self::SetLobbyOptions { from, .. } => Some(from.clone()),
+            Self::StatusUpdate { client_id, .. } => Some(client_id.clone()),
+            Self::Forward => serde_json::from_str::<serde_json::Value>(raw)
+                .ok()?
+                .get("from")?
+                .as_str()
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileShareInfo {
     #[serde(rename = "shareId")]
@@ -609,8 +651,25 @@ async fn handle_connection(
                     
                     match serde_json::from_str::<SignalingMessage>(text) {
                         Ok(message) => {
+                            if let Some(claimed_sender) = message.claimed_sender(text) {
+                                if client_id.as_deref() != Some(claimed_sender.as_str()) {
+                                    log::warn!(
+                                        "拒绝发送者身份不匹配的消息: registered={:?}, claimed={}, peer={}",
+                                        client_id,
+                                        claimed_sender,
+                                        addr
+                                    );
+                                    continue;
+                                }
+                            }
+
                             match message {
                                 SignalingMessage::Register { client_id: cid, player_name, virtual_ip, virtual_domain, use_domain, lobby_name, lobby_password, client_version } => {
+                                    if is_registered {
+                                        log::warn!("拒绝同一连接重复注册: peer={}, registered={:?}", addr, client_id);
+                                        break;
+                                    }
+
                                     log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?}", 
                                         player_name, cid, lobby_name, client_version, virtual_ip, virtual_domain, use_domain);
                                     
@@ -633,8 +692,17 @@ async fn handle_connection(
                                         break;
                                     }
                                     
+                                    if cid.trim().is_empty() {
+                                        let error_msg = SignalingMessage::RegisterError {
+                                            message: "clientId 不能为空".to_string(),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&error_msg) {
+                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                        }
+                                        continue;
+                                    }
+
                                     log::info!("✅ 版本检查通过: {} (版本: {})", player_name, version_str);
-                                    is_registered = true;
                                     
                                     // 生成大厅ID
                                     let lid = generate_lobby_id(&lobby_name, &lobby_password);
@@ -650,12 +718,27 @@ async fn handle_connection(
                                         player_name: player_name.clone(),
                                         virtual_ip: virtual_ip.clone(),
                                         virtual_domain: virtual_domain.clone(),
-                                        use_domain: use_domain,
+                                        use_domain,
                                         sender: Arc::clone(&write),
                                     };
                                     
                                     // 获取或创建大厅
                                     let mut lobbies_write = lobbies.write().await;
+                                    if lobbies_write
+                                        .values()
+                                        .any(|existing_lobby| existing_lobby.clients.contains_key(&cid))
+                                    {
+                                        log::warn!("拒绝重复 clientId 注册: {} ({})", player_name, cid);
+                                        let error_msg = SignalingMessage::RegisterError {
+                                            message: "客户端身份已在使用中，请重新连接".to_string(),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&error_msg) {
+                                            let _ = write.write().await.send(Message::Text(json)).await;
+                                        }
+                                        // Close the duplicate session so reconnecting clients can
+                                        // retry after the previous connection finishes cleanup.
+                                        break;
+                                    }
                                     let lobby = lobbies_write.entry(lid.clone()).or_insert_with(|| {
                                         log::info!("🏠 创建新大厅: {} (ID: {})，房主: {}", lobby_name, lid, cid);
                                         LobbyInfo {
@@ -710,6 +793,7 @@ async fn handle_connection(
                                     client_lobby_map.write().await.insert(cid.clone(), lid.clone());
                                     client_id = Some(cid.clone());
                                     lobby_id = Some(lid.clone());
+                                    is_registered = true;
                                     
                                     log::info!("✅ 客户端 {} 已加入大厅 {} (当前 {} 人)", player_name, lobby_name, 
                                         lobbies.read().await.get(&lid).map(|l| l.clients.len()).unwrap_or(0));
@@ -758,7 +842,7 @@ async fn handle_connection(
                                             player_name: player_name.clone(),
                                             virtual_ip: virtual_ip.clone(),
                                             virtual_domain: virtual_domain.clone(),
-                                            use_domain: use_domain,
+                                            use_domain,
                                         },
                                     ).await;
                                 }
@@ -1844,5 +1928,219 @@ async fn broadcast_to_lobby(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_connection, ClientLobbyMap, Lobbies, SignalingMessage};
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+
+    async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
+        let client_lobby_map: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    break;
+                };
+                let lobbies = Arc::clone(&lobbies);
+                let client_lobby_map = Arc::clone(&client_lobby_map);
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, peer, lobbies, client_lobby_map).await;
+                });
+            }
+        });
+
+        (address, task)
+    }
+
+    async fn next_frame<S>(socket: &mut WebSocketStream<S>) -> Option<Message>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        match timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+        {
+            Some(Ok(message)) => Some(message),
+            Some(Err(error)) => panic!("test WebSocket failed: {error}"),
+            None => None,
+        }
+    }
+
+    async fn next_json<S>(socket: &mut WebSocketStream<S>) -> Value
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            let message = next_frame(socket)
+                .await
+                .expect("test WebSocket closed before receiving JSON");
+            if let Message::Text(text) = message {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+
+    fn register_message(client_id: &str, lobby_name: &str, lobby_password: &str) -> Message {
+        Message::Text(
+            serde_json::json!({
+                "type": "register",
+                "clientId": client_id,
+                "playerName": client_id,
+                "lobbyName": lobby_name,
+                "lobbyPassword": lobby_password,
+                "clientVersion": "2.7.5"
+            })
+            .to_string(),
+        )
+    }
+
+    async fn register<S>(socket: &mut WebSocketStream<S>, client_id: &str, lobby_name: &str)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        socket
+            .send(register_message(client_id, lobby_name, "password"))
+            .await
+            .unwrap();
+        assert_eq!(next_json(socket).await["type"], "register-success");
+        assert_eq!(next_json(socket).await["type"], "players-list");
+    }
+
+    #[test]
+    fn extracts_sender_from_typed_host_command() {
+        let raw = r#"{"type":"kick-player","from":"host-id","target":"peer-id"}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(message.claimed_sender(raw).as_deref(), Some("host-id"));
+    }
+
+    #[test]
+    fn extracts_sender_from_forwarded_message() {
+        let raw = r#"{"type":"remote-control-request","from":"controller-id","to":"phone-id"}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert!(matches!(message, SignalingMessage::Forward));
+        assert_eq!(message.claimed_sender(raw).as_deref(), Some("controller-id"));
+    }
+
+    #[test]
+    fn server_messages_do_not_claim_a_client_identity() {
+        let raw = r#"{"type":"kicked","reason":"removed"}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(message.claimed_sender(raw), None);
+    }
+
+    #[test]
+    fn extracts_sender_from_status_update() {
+        let raw = r#"{"type":"status-update","clientId":"player-id","micEnabled":true}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(message.claimed_sender(raw).as_deref(), Some("player-id"));
+    }
+
+    #[test]
+    fn register_message_does_not_claim_a_sender() {
+        let raw = r#"{"type":"register","clientId":"player-id","playerName":"player","lobbyName":"room","lobbyPassword":"password","clientVersion":"2.7.5"}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(message.claimed_sender(raw), None);
+    }
+
+    #[test]
+    fn forwarded_message_without_string_sender_does_not_claim_identity() {
+        let raw = r#"{"type":"remote-control-request","from":123,"to":"phone-id"}"#;
+        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
+
+        assert!(matches!(message, SignalingMessage::Forward));
+        assert_eq!(message.claimed_sender(raw), None);
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_id_is_rejected_without_replacing_existing_session() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut first, _) = connect_async(&url).await.unwrap();
+        register(&mut first, "same-id", "same-room").await;
+
+        let (mut duplicate, _) = connect_async(&url).await.unwrap();
+        duplicate
+            .send(register_message("same-id", "same-room", "password"))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut duplicate).await["type"], "register-error");
+        match timeout(Duration::from_secs(2), duplicate.next())
+            .await
+            .unwrap()
+        {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+            Some(Ok(message)) => panic!("duplicate session stayed open with {message:?}"),
+        }
+
+        first
+            .send(Message::Text(
+                serde_json::json!({"type":"ping"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut first).await["type"], "pong");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forged_host_command_does_not_remove_authenticated_peer() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        register(&mut host, "host-id", "room").await;
+
+        let (mut peer, _) = connect_async(&url).await.unwrap();
+        register(&mut peer, "peer-id", "room").await;
+        assert_eq!(next_json(&mut host).await["type"], "player-joined");
+
+        peer.send(Message::Text(
+            serde_json::json!({
+                "type": "kick-player",
+                "from": "host-id",
+                "target": "peer-id"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        peer.send(Message::Text(
+            serde_json::json!({
+                "type": "offer",
+                "from": "peer-id",
+                "to": "host-id",
+                "offer": {"type": "offer", "sdp": "test"}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let offer = next_json(&mut host).await;
+        assert_eq!(offer["type"], "offer");
+        assert_eq!(offer["from"], "peer-id");
+
+        server.abort();
     }
 }
