@@ -1,0 +1,30 @@
+services:
+  # MCTier 信令服务器（HTTP 模式，仅用于 IP 地址部署）
+  mctier-signaling:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mctier-signaling
+    restart: unless-stopped
+    ports:
+      - "8445:8445"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - BIND_ADDRESS=0.0.0.0:8445
+      - MINIMUM_CLIENT_VERSION=${MINIMUM_CLIENT_VERSION:-2.1.0}
+      - CLIENT_DOWNLOAD_URL=${CLIENT_DOWNLOAD_URL:-https://github.com/pmh1314520/MCTier/releases}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/localhost/8445' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: mctier-network

@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+.github
+
+# 文档
+*.md
+LICENSE
+
+# Rust 构建产物
+target/
+
+# Docker / 部署相关（构建镜像时不需要）
+docker-compose.yml
+docker-compose-http.yml
+nginx.conf
+deploy.sh
+
+# 证书与环境变量（禁止进入镜像）
+certbot/
+letsencrypt/
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志与临时文件
+*.log
+logs/
+*.tmp
+*.bak

@@ -1,0 +1,63 @@
+services:
+  # MCTier 信令服务器
+  mctier-signaling:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mctier-signaling
+    restart: unless-stopped
+    # HTTPS/WSS 模式下不把 8445 直接暴露到公网，仅允许 nginx 通过内部网络访问。
+    # 如需本机调试，可改为：ports: ["127.0.0.1:8445:8445"]
+    expose:
+      - "8445"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - BIND_ADDRESS=0.0.0.0:8445
+      - MINIMUM_CLIENT_VERSION=${MINIMUM_CLIENT_VERSION:-2.1.0}
+      - CLIENT_DOWNLOAD_URL=${CLIENT_DOWNLOAD_URL:-https://github.com/pmh1314520/MCTier/releases}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/localhost/8445' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx 反向代理（用于 HTTPS/WSS）
+  nginx:
+    image: nginx:alpine
+    container_name: mctier-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - mctier-signaling
+    command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Certbot（自动申请和续期 SSL 证书）
+  certbot:
+    image: certbot/certbot
+    container_name: mctier-certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+networks:
+  default:
+    name: mctier-network

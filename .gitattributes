@@ -1,0 +1,11 @@
+# 统一使用 LF 提交，避免 Windows 下的 CRLF 进入仓库
+* text=auto eol=lf
+
+# 这些文件在 Linux 容器中执行/解析，必须是 LF
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.conf      text eol=lf
+*.rs        text eol=lf
+*.toml      text eol=lf
+Cargo.lock  text eol=lf

@@ -1,0 +1,39 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+*.pdb
+
+# 注意：本项目是可执行程序（binary crate），Cargo.lock 必须提交，
+# 以保证 Docker 构建与本地构建依赖版本一致。
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Let's Encrypt / Certbot 运行时数据
+certbot/
+letsencrypt/
+
+# 日志
+*.log
+logs/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
