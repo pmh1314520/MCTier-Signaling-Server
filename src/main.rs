@@ -628,6 +628,20 @@ async fn send_to_lobby_client(
     }
 }
 
+async fn is_current_session(
+    lobbies: &Lobbies,
+    lobby_id: &str,
+    client_id: &str,
+    sender: &ClientSender,
+) -> bool {
+    let lobbies_read = lobbies.read().await;
+    lobbies_read
+        .get(lobby_id)
+        .and_then(|lobby| lobby.clients.get(client_id))
+        .map(|client| Arc::ptr_eq(&client.sender, sender))
+        .unwrap_or(false)
+}
+
 /// 生成大厅ID（基于大厅名称和密码的哈希）
 fn generate_lobby_id(lobby_name: &str, password: &str) -> String {
     let mut hasher = Sha256::new();
@@ -802,6 +816,20 @@ async fn handle_connection_with_timeouts(
 
         match msg_result {
             Ok(msg) => {
+                if is_registered {
+                    let current = match (client_id.as_deref(), lobby_id.as_deref()) {
+                        (Some(client_id), Some(lobby_id)) => {
+                            is_current_session(&lobbies, lobby_id, client_id, &write).await
+                        }
+                        _ => false,
+                    };
+                    if !current {
+                        log::warn!("拒绝已失效 WebSocket 会话的消息: peer={}", addr);
+                        let _ = send_message(&write, Message::Close(None)).await;
+                        break;
+                    }
+                }
+
                 if msg.is_text() {
                     let text = msg.to_text()?;
                     
@@ -1668,22 +1696,34 @@ async fn handle_connection_with_timeouts(
                                     };
                                     // 校验房主身份并取出目标 sender
                                     let mut target_sender = None;
+                                    let mut target_removed = false;
                                     {
-                                        let lobbies_read = lobbies.read().await;
-                                        if let Some(lobby) = lobbies_read.get(&lid) {
+                                        let mut lobbies_write = lobbies.write().await;
+                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
                                             if lobby.host_id != from {
                                                 log::warn!("🚫 非房主尝试踢人: {}", from);
-                                                drop(lobbies_read);
                                                 continue;
                                             }
                                             if from == target {
-                                                drop(lobbies_read);
                                                 continue; // 不能踢自己
                                             }
-                                            if let Some(t) = lobby.clients.get(&target) {
+                                            if let Some(t) = lobby.clients.remove(&target) {
                                                 target_sender = Some(Arc::clone(&t.sender));
+                                                lobby.muted.remove(&target);
+                                                target_removed = true;
+                                                let mut client_lobby_map_write = client_lobby_map.write().await;
+                                                if client_lobby_map_write
+                                                    .get(&target)
+                                                    .map(|mapped_lobby| mapped_lobby == &lid)
+                                                    .unwrap_or(false)
+                                                {
+                                                    client_lobby_map_write.remove(&target);
+                                                }
                                             }
                                         }
+                                    }
+                                    if !target_removed {
+                                        continue;
                                     }
                                     // 通知被踢者
                                     if let Some(sender) = target_sender {
@@ -1691,16 +1731,8 @@ async fn handle_connection_with_timeouts(
                                         if let Ok(json) = serde_json::to_string(&kicked) {
                                             send_text(&sender, json).await;
                                         }
+                                        let _ = send_message(&sender, Message::Close(None)).await;
                                     }
-                                    // 从大厅移除目标
-                                    {
-                                        let mut lobbies_write = lobbies.write().await;
-                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
-                                            lobby.clients.remove(&target);
-                                            lobby.muted.remove(&target);
-                                        }
-                                    }
-                                    client_lobby_map.write().await.remove(&target);
                                     log::info!("👢 房主 {} 踢出了 {}", from, target);
                                     // 广播玩家离开
                                     broadcast_to_lobby(
@@ -2488,6 +2520,110 @@ mod tests {
         let offer = next_json(&mut host).await;
         assert_eq!(offer["type"], "offer");
         assert_eq!(offer["from"], "peer-id");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kicked_old_socket_cannot_forward_after_same_id_reconnects() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        register(&mut host, "host-id", "room").await;
+
+        let (mut old_peer, _) = connect_async(&url).await.unwrap();
+        register(&mut old_peer, "peer-id", "room").await;
+        assert_eq!(next_json(&mut host).await["type"], "player-joined");
+
+        host.send(Message::Text(
+            serde_json::json!({
+                "type": "kick-player",
+                "from": "host-id",
+                "target": "peer-id"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next_json(&mut old_peer).await["type"], "kicked");
+        assert_eq!(next_json(&mut host).await["type"], "player-left");
+
+        let (mut new_peer, _) = connect_async(&url).await.unwrap();
+        register(&mut new_peer, "peer-id", "room").await;
+        assert_eq!(next_json(&mut host).await["type"], "player-joined");
+
+        let _ = old_peer
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "offer",
+                    "from": "peer-id",
+                    "to": "host-id",
+                    "offer": {"type": "offer", "sdp": "stale"}
+                })
+                .to_string(),
+            ))
+            .await;
+        assert!(timeout(Duration::from_millis(250), host.next()).await.is_err());
+
+        new_peer
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "offer",
+                    "from": "peer-id",
+                    "to": "host-id",
+                    "offer": {"type": "offer", "sdp": "current"}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let offer = next_json(&mut host).await;
+        assert_eq!(offer["type"], "offer");
+        assert_eq!(offer["offer"]["sdp"], "current");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kick_does_not_remove_mapping_for_target_in_another_lobby() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        register(&mut host, "host-a", "room-a").await;
+
+        let (mut target, _) = connect_async(&url).await.unwrap();
+        register(&mut target, "target-b", "room-b").await;
+        let (mut peer, _) = connect_async(&url).await.unwrap();
+        register(&mut peer, "peer-b", "room-b").await;
+        assert_eq!(next_json(&mut target).await["type"], "player-joined");
+
+        host.send(Message::Text(
+            serde_json::json!({
+                "type": "kick-player",
+                "from": "host-a",
+                "target": "target-b"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        assert!(timeout(Duration::from_millis(250), host.next()).await.is_err());
+
+        target
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "offer",
+                    "from": "target-b",
+                    "to": "peer-b",
+                    "offer": {"type": "offer", "sdp": "other-lobby"}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let offer = next_json(&mut peer).await;
+        assert_eq!(offer["type"], "offer");
+        assert_eq!(offer["offer"]["sdp"], "other-lobby");
 
         server.abort();
     }
