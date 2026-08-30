@@ -40,6 +40,11 @@ const MAX_LOBBY_PASSWORD_LEN: usize = 256;
 const MAX_VIRTUAL_DOMAIN_LEN: usize = 253;
 const MAX_CLIENT_VERSION_LEN: usize = 32;
 
+/// 聊天签名公钥（X.509 SubjectPublicKeyInfo DER 的 base64）长度上限。
+/// 未压缩 P-256 公钥 DER 为 91 字节，base64 后约 124 字符，留出余量后仍能
+/// 拦住任何异常大的值——服务器只做长度与字符集校验，不解析密钥本身。
+const MAX_CHAT_PUBLIC_KEY_LEN: usize = 512;
+
 /// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
@@ -159,6 +164,10 @@ pub enum SignalingMessage {
         lobby_password: String,
         #[serde(rename = "clientVersion", skip_serializing_if = "Option::is_none")]
         client_version: Option<String>,
+        /// 该成员的聊天签名公钥。只有公钥经过服务器，私钥永不离开客户端；
+        /// 服务器把它当作与 clientId 绑定的不透明凭据转发给其他成员。
+        #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
+        chat_public_key: Option<String>,
     },
     /// 注册成功
     RegisterSuccess {
@@ -219,6 +228,9 @@ pub enum SignalingMessage {
         virtual_domain: Option<String>,
         #[serde(rename = "useDomain", skip_serializing_if = "Option::is_none")]
         use_domain: Option<bool>,
+        /// 与 players-list 同源的聊天签名公钥，保证增量事件也带齐验签材料。
+        #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
+        chat_public_key: Option<String>,
     },
     /// 玩家离开
     PlayerLeft {
@@ -613,6 +625,10 @@ pub struct PlayerInfo {
     pub virtual_domain: Option<String>,
     #[serde(rename = "useDomain", skip_serializing_if = "Option::is_none")]
     pub use_domain: Option<bool>,
+    /// 该成员的聊天签名公钥。收到名册的客户端据此验签，从而不必再用
+    /// 数据包源 IP 判断消息作者——虚拟 IP 可被同大厅成员伪造，公钥不能。
+    #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
+    pub chat_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,6 +662,9 @@ struct ClientInfo {
     virtual_ip: Option<String>,
     virtual_domain: Option<String>,
     use_domain: Option<bool>,
+    /// 注册时提交的聊天签名公钥。绑定在这里意味着它只能随该连接的注册身份
+    /// 进入名册，别的成员无法替它声明或改写。
+    chat_public_key: Option<String>,
     sender: ClientSender,
     disconnect: watch::Sender<bool>,
 }
@@ -739,6 +758,32 @@ fn valid_text(value: &str, max_len: usize, allow_empty: bool) -> bool {
     (allow_empty || !value.trim().is_empty())
         && value.len() <= max_len
         && !value.chars().any(char::is_control)
+}
+
+/// 聊天签名公钥只做形状校验：base64 字符集 + 长度上限。
+///
+/// 服务器刻意不解析曲线点——它不需要，也不应该成为密码学解析器的攻击面。
+/// 真正的解析与验签由收到名册的客户端完成，非法公钥在那里被拒绝。
+fn valid_chat_public_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CHAT_PUBLIC_KEY_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+/// 归一化注册时提交的公钥：非法值一律丢弃成 None，而不是原样入册。
+///
+/// 丢弃而非报错是为了兼容旧客户端——它们不发这个字段，仍可加入大厅，
+/// 只是拿不到签名能力（对端会因缺签名而拒收其消息）。
+fn normalize_chat_public_key(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    if valid_chat_public_key(&trimmed) {
+        Some(trimmed)
+    } else {
+        log::warn!("丢弃格式非法的聊天签名公钥");
+        None
+    }
 }
 
 fn effective_public_setting(requested_public: bool, is_passwordless: bool) -> bool {
@@ -1661,6 +1706,7 @@ async fn handle_connection_with_timeouts(
                                     lobby_name,
                                     lobby_password,
                                     client_version,
+                                    chat_public_key,
                                 } => {
                                     if is_registered {
                                         log::warn!(
@@ -1692,8 +1738,12 @@ async fn handle_connection_with_timeouts(
                                         continue;
                                     }
 
-                                    log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?}", 
-                                        player_name, cid, lobby_name, client_version, virtual_ip, virtual_domain, use_domain);
+                                    let chat_public_key =
+                                        normalize_chat_public_key(chat_public_key);
+
+                                    log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?} - 聊天公钥: {}", 
+                                        player_name, cid, lobby_name, client_version, virtual_ip, virtual_domain, use_domain,
+                                        if chat_public_key.is_some() { "已提交" } else { "未提交" });
 
                                     // 检查客户端版本
                                     let version_str =
@@ -1846,6 +1896,7 @@ async fn handle_connection_with_timeouts(
                                         virtual_ip: Some(virtual_ip.to_string()),
                                         virtual_domain: virtual_domain.clone(),
                                         use_domain,
+                                        chat_public_key: chat_public_key.clone(),
                                         sender: Arc::clone(&write),
                                         disconnect: disconnect_tx.clone(),
                                     };
@@ -1974,6 +2025,9 @@ async fn handle_connection_with_timeouts(
                                                         virtual_ip: info.virtual_ip.clone(),
                                                         virtual_domain: info.virtual_domain.clone(),
                                                         use_domain: info.use_domain,
+                                                        chat_public_key: info
+                                                            .chat_public_key
+                                                            .clone(),
                                                     })
                                                     .collect::<Vec<_>>()
                                             })
@@ -2006,6 +2060,7 @@ async fn handle_connection_with_timeouts(
                                             virtual_ip: Some(virtual_ip.to_string()),
                                             virtual_domain: virtual_domain.clone(),
                                             use_domain,
+                                            chat_public_key: chat_public_key.clone(),
                                         },
                                     )
                                     .await;
@@ -3685,6 +3740,7 @@ mod tests {
                 virtual_ip: None,
                 virtual_domain: None,
                 use_domain: None,
+                chat_public_key: None,
                 sender: Arc::clone(&sender),
                 disconnect,
             },
@@ -3771,6 +3827,7 @@ mod tests {
             lobby_name: "test-lobby".to_string(),
             lobby_password: "test-password".to_string(),
             client_version: Some("2.1.0".to_string()),
+            chat_public_key: None,
         };
         client
             .send(Message::Text(
@@ -3971,6 +4028,26 @@ mod tests {
         )
     }
 
+    fn register_message_with_chat_key(
+        client_id: &str,
+        lobby_name: &str,
+        chat_public_key: &str,
+    ) -> Message {
+        Message::Text(
+            serde_json::json!({
+                "type": "register",
+                "clientId": client_id,
+                "playerName": client_id,
+                "virtualIp": test_virtual_ip(client_id),
+                "lobbyName": lobby_name,
+                "lobbyPassword": "password",
+                "clientVersion": "2.7.5",
+                "chatPublicKey": chat_public_key
+            })
+            .to_string(),
+        )
+    }
+
     fn register_message(client_id: &str, lobby_name: &str, lobby_password: &str) -> Message {
         register_message_with_ip(
             client_id,
@@ -4057,6 +4134,72 @@ mod tests {
 
         assert!(matches!(message, SignalingMessage::Forward));
         assert_eq!(message.claimed_sender(raw), None);
+    }
+
+    #[test]
+    fn chat_public_keys_are_shape_checked_before_entering_a_roster() {
+        // Well formed base64 of a plausible DER length is accepted.
+        assert!(valid_chat_public_key(
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        ));
+        assert!(!valid_chat_public_key(""));
+        // Anything outside the base64 alphabet is refused, which keeps quoting
+        // and injection tricks out of a field that is later echoed to peers.
+        assert!(!valid_chat_public_key("has spaces"));
+        assert!(!valid_chat_public_key("bad\ncontrol"));
+        assert!(!valid_chat_public_key("<script>"));
+        assert!(!valid_chat_public_key(
+            &"A".repeat(MAX_CHAT_PUBLIC_KEY_LEN + 1)
+        ));
+
+        // Normalization trims but never repairs: invalid input becomes None so
+        // an old client can still join, just without signing capability.
+        assert_eq!(
+            normalize_chat_public_key(Some("  AAAA  ".to_string())),
+            Some("AAAA".to_string())
+        );
+        assert_eq!(normalize_chat_public_key(Some("!!".to_string())), None);
+        assert_eq!(normalize_chat_public_key(None), None);
+    }
+
+    #[tokio::test]
+    async fn chat_public_keys_reach_peers_bound_to_their_owner() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let host_key = "SG9zdEtleQ==";
+        let peer_key = "UGVlcktleQ==";
+
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        host.send(register_message_with_chat_key("host-id", "room", host_key))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut host).await["type"], "register-success");
+        assert_eq!(next_json(&mut host).await["type"], "players-list");
+
+        let (mut peer, _) = connect_async(&url).await.unwrap();
+        peer.send(register_message_with_chat_key("peer-id", "room", peer_key))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut peer).await["type"], "register-success");
+
+        // The joiner's roster must carry the host's key, bound to the host id.
+        let roster = next_json(&mut peer).await;
+        assert_eq!(roster["type"], "players-list");
+        let players = roster["players"].as_array().unwrap();
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0]["playerId"], "host-id");
+        assert_eq!(players[0]["chatPublicKey"], host_key);
+
+        // And the incremental join event must carry the joiner's own key, so a
+        // member never has to guess which key belongs to which player.
+        let rotated = next_json(&mut host).await;
+        assert_eq!(rotated["type"], "chat-token-rotated");
+        let joined = next_json(&mut host).await;
+        assert_eq!(joined["type"], "player-joined");
+        assert_eq!(joined["playerId"], "peer-id");
+        assert_eq!(joined["chatPublicKey"], peer_key);
+
+        server.abort();
     }
 
     #[tokio::test]
