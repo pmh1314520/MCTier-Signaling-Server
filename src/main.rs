@@ -34,6 +34,14 @@ const MAX_FRAME_SIZE: usize = 512 * 1024;
 /// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
+/// 已注册连接的空闲超时。
+///
+/// 客户端（桌面端与 Android 端）均以 15 秒周期发送应用层 {"type":"ping"}，
+/// 因此正常连接不会触发该超时。半开连接（休眠 / 切换网络 / NAT 表超时，
+/// 对端未发出 FIN）会一直停在 read.next() 上，若不回收则该 clientId 的
+/// 会话永久留在大厅里；由于重复 clientId 会被拒绝注册，该玩家将无法重连。
+const REGISTERED_IDLE_TIMEOUT_SECS: u64 = 60;
+
 /// 版本过低时提示客户端的下载地址（可通过环境变量 CLIENT_DOWNLOAD_URL 覆盖）
 const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://github.com/pmh1314520/MCTier/releases";
 
@@ -757,6 +765,7 @@ async fn handle_connection(
         client_lobby_map,
         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
+        tokio::time::Duration::from_secs(REGISTERED_IDLE_TIMEOUT_SECS),
     )
     .await
 }
@@ -768,6 +777,7 @@ async fn handle_connection_with_timeouts(
     client_lobby_map: ClientLobbyMap,
     handshake_timeout: tokio::time::Duration,
     registration_timeout: tokio::time::Duration,
+    idle_timeout: tokio::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 升级到 WebSocket
     let ws_stream = match tokio::time::timeout(
@@ -799,9 +809,20 @@ async fn handle_connection_with_timeouts(
     // 处理消息
     loop {
         let msg_result = if is_registered {
-            match read.next().await {
-                Some(msg_result) => msg_result,
-                None => break,
+            // 已注册连接同样需要上界：客户端每 15 秒发送应用层 ping，
+            // 长时间完全静默说明连接已半开，必须回收，否则该 clientId 无法重连。
+            match tokio::time::timeout(idle_timeout, read.next()).await {
+                Ok(Some(msg_result)) => msg_result,
+                Ok(None) => break,
+                Err(_) => {
+                    log::warn!(
+                        "已注册连接空闲超时（{} 毫秒），回收会话: peer={}, client={:?}",
+                        idle_timeout.as_millis(),
+                        addr,
+                        client_id
+                    );
+                    break;
+                }
             }
         } else {
             match tokio::time::timeout_at(registration_deadline, read.next()).await {
@@ -2206,6 +2227,7 @@ mod tests {
                 client_lobby_map,
                 tokio::time::Duration::from_secs(1),
                 registration_timeout,
+                tokio::time::Duration::from_secs(300),
             )
             .await
             .expect("test server connection should finish cleanly");
@@ -2326,6 +2348,15 @@ mod tests {
         assert!(matches!(server_result, Some(Err(_))), "oversized message should be rejected");
     }
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_test_server_with_idle_timeout(tokio::time::Duration::from_secs(
+            REGISTERED_IDLE_TIMEOUT_SECS,
+        ))
+        .await
+    }
+
+    async fn spawn_test_server_with_idle_timeout(
+        idle_timeout: tokio::time::Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -2339,7 +2370,16 @@ mod tests {
                 let lobbies = Arc::clone(&lobbies);
                 let client_lobby_map = Arc::clone(&client_lobby_map);
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, peer, lobbies, client_lobby_map).await;
+                    let _ = handle_connection_with_timeouts(
+                        stream,
+                        peer,
+                        lobbies,
+                        client_lobby_map,
+                        tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
+                        tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
+                        idle_timeout,
+                    )
+                    .await;
                 });
             }
         });
@@ -2584,6 +2624,67 @@ mod tests {
         server.abort();
     }
 
+    // 半开连接（对端未发 FIN）必须被空闲超时回收，否则该 clientId 的会话会永久
+    // 留在大厅里；又因为重复 clientId 会被拒绝注册，该玩家将再也无法重连。
+    #[tokio::test]
+    async fn half_open_session_is_reclaimed_so_same_id_can_reconnect() {
+        let (address, server) =
+            spawn_test_server_with_idle_timeout(tokio::time::Duration::from_millis(200)).await;
+        let url = format!("ws://{address}");
+
+        let (mut ghost, _) = connect_async(&url).await.unwrap();
+        register(&mut ghost, "ghost-id", "room").await;
+
+        // 保持 socket 打开但不再发送任何数据，也不发 Close，模拟半开连接。
+        let leaked = ghost;
+
+        // 空闲超时到达后，旧会话被回收，同 clientId 可以重新注册成功。
+        let mut reconnected = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (mut retry, _) = connect_async(&url).await.unwrap();
+            retry
+                .send(register_message("ghost-id", "room", "password"))
+                .await
+                .unwrap();
+            if next_json(&mut retry).await["type"] == "register-success" {
+                reconnected = true;
+                break;
+            }
+        }
+        assert!(
+            reconnected,
+            "half-open session was never reclaimed, same clientId is permanently locked out"
+        );
+
+        drop(leaked);
+        server.abort();
+    }
+
+    // 正常连接不应被空闲超时误杀：客户端持续发送应用层 ping 即可续期。
+    #[tokio::test]
+    async fn active_session_is_not_closed_by_idle_timeout() {
+        let (address, server) =
+            spawn_test_server_with_idle_timeout(tokio::time::Duration::from_millis(300)).await;
+        let url = format!("ws://{address}");
+
+        let (mut client, _) = connect_async(&url).await.unwrap();
+        register(&mut client, "active-id", "room").await;
+
+        // 以远小于空闲超时的间隔发送 ping，累计时长超过空闲超时。
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            client
+                .send(Message::Text(
+                    serde_json::json!({"type":"ping"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(next_json(&mut client).await["type"], "pong");
+        }
+
+        server.abort();
+    }
     #[tokio::test]
     async fn kick_does_not_remove_mapping_for_target_in_another_lobby() {
         let (address, server) = spawn_test_server().await;

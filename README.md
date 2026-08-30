@@ -80,6 +80,7 @@ docker compose -f docker-compose-http.yml logs -f
 | `RUST_LOG` | `info` | 日志级别：`error`/`warn`/`info`/`debug`/`trace` |
 | `MINIMUM_CLIENT_VERSION` | `2.1.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
 | `CLIENT_DOWNLOAD_URL` | MCTier Releases 页面 | 版本过低时提示给客户端的下载地址 |
+| `MAX_CONNECTIONS` | `1024` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
 
 修改环境变量后需要重建容器才会生效：
 
