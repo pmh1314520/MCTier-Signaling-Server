@@ -84,6 +84,7 @@ docker compose -f docker-compose-http.yml logs -f
 | `MAX_CONNECTIONS` | `1024` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
 | `COMMUNITY_NODES_FILE` | `community_nodes.json` | 用户投稿共享节点的存档路径。Docker 部署下为 `/app/data/community_nodes.json`，已挂载命名卷，容器重建后投稿不丢失 |
 | `COMMUNITY_NODE_CAPACITY` | `200` | 共享节点列表容量上限 |
+| `COMMUNITY_NODE_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许探测回环/内网/保留地址。默认只探测公网地址，避免投稿接口被当作内网端口扫描器（SSRF）。仅同内网自建部署才需开启 |
 
 修改环境变量后需要重建容器才会生效：
 
@@ -243,7 +244,10 @@ cargo build --release
 - `lastOkAt` 距今**超过 1 天**即自动移除，并立即写回存档；
 - 短暂不可达只把 `online` 置为 `false`，不会立刻删除，避免一次网络抖动误删正常节点；
 - 探测以 TCP 握手为准；`udp://` 节点在 TCP 不通时退化为 UDP 探测（收到 ICMP 端口不可达才判失效）；
-- 同一来源 IP 的投稿有 30 秒冷却，地址会归一化后去重（协议/主机大小写、缺省端口视为同一节点）。
+- 同一来源 IP 的投稿有 30 秒冷却，地址会归一化后去重（协议/主机大小写、缺省端口视为同一节点）；
+- 投稿地址先解析成 IP 再校验，**只探测公网可路由的单播地址**：回环、私有网段、链路本地
+  （含 `169.254.169.254` 云元数据）、CGNAT、文档/保留段以及它们的 IPv6 映射写法一律拒绝，
+  防止有人借投稿接口把服务器变成内网端口扫描器；解析结果直接用于连接，不留 DNS Rebinding 窗口。
 
 ### 屏幕共享与文件共享
 
