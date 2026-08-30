@@ -40,6 +40,9 @@ WORKDIR /app
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/target/release/mctier-signaling-server /app/mctier-signaling-server
 
+# 用户投稿共享节点的存档目录（compose 中挂载为命名卷，容器重建后不丢）
+RUN mkdir -p /app/data
+
 # 更改所有权
 RUN chown -R mctier:mctier /app
 
@@ -52,6 +55,7 @@ EXPOSE 8445
 # 设置环境变量
 ENV RUST_LOG=info
 ENV BIND_ADDRESS=0.0.0.0:8445
+ENV COMMUNITY_NODES_FILE=/app/data/community_nodes.json
 
 # 启动服务
 CMD ["/app/mctier-signaling-server"]

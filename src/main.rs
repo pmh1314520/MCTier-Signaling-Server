@@ -45,6 +45,42 @@ const REGISTERED_IDLE_TIMEOUT_SECS: u64 = 60;
 /// 版本过低时提示客户端的下载地址（可通过环境变量 CLIENT_DOWNLOAD_URL 覆盖）
 const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://github.com/pmh1314520/MCTier/releases";
 
+// ==================== 用户投稿的共享节点 ====================
+
+/// 节点连续探测失败（或从未成功）超过该时长后自动移除。
+///
+/// 需求为“节点失效超过 1 天时自动移除”，因此这里以“最近一次探测成功时间”
+/// 为基准：只要 now - last_ok_at 超过该阈值即淘汰。刚投稿的节点必须先通过
+/// 一次探测才会入库，因此 last_ok_at 不会是 0。
+const COMMUNITY_NODE_MAX_OFFLINE_SECS: u64 = 24 * 60 * 60;
+
+/// 后台巡检周期：每轮对全部投稿节点做一次可达性探测
+const COMMUNITY_NODE_PROBE_INTERVAL_SECS: u64 = 5 * 60;
+
+/// 单个节点的探测超时
+const COMMUNITY_NODE_PROBE_TIMEOUT_SECS: u64 = 3;
+
+/// 单轮巡检的最大并发探测数，避免节点很多时瞬间打满 fd
+const COMMUNITY_NODE_PROBE_CONCURRENCY: usize = 16;
+
+/// 注册表容量上限（可通过环境变量 COMMUNITY_NODE_CAPACITY 覆盖）
+const DEFAULT_COMMUNITY_NODE_CAPACITY: usize = 200;
+
+/// 持久化文件路径（可通过环境变量 COMMUNITY_NODES_FILE 覆盖）
+const DEFAULT_COMMUNITY_NODES_FILE: &str = "community_nodes.json";
+
+/// 同一来源 IP 两次投稿之间的最小间隔，防刷
+const COMMUNITY_NODE_SUBMIT_COOLDOWN_SECS: u64 = 30;
+
+/// 投稿节点名称长度上限
+const COMMUNITY_NODE_NAME_MAX_LEN: usize = 32;
+
+/// 投稿节点地址长度上限
+const COMMUNITY_NODE_ADDRESS_MAX_LEN: usize = 128;
+
+/// 投稿者昵称长度上限
+const COMMUNITY_NODE_SUBMITTER_MAX_LEN: usize = 24;
+
 /// 读取环境变量，并过滤掉空值
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -64,6 +100,32 @@ fn client_download_url() -> &'static str {
 fn minimum_client_version() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| env_or("MINIMUM_CLIENT_VERSION", DEFAULT_MINIMUM_CLIENT_VERSION))
+}
+
+/// 投稿节点注册表容量上限（进程内只解析一次）
+fn community_node_capacity() -> usize {
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("COMMUNITY_NODE_CAPACITY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_COMMUNITY_NODE_CAPACITY)
+    })
+}
+
+/// 投稿节点持久化文件路径（进程内只解析一次）
+fn community_nodes_file() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| env_or("COMMUNITY_NODES_FILE", DEFAULT_COMMUNITY_NODES_FILE))
+}
+
+/// 当前 Unix 时间戳（秒）
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// WebSocket 信令消息
@@ -406,6 +468,30 @@ pub enum SignalingMessage {
     PublicLobbyListResponse {
         lobbies: Vec<PublicLobbyInfo>,
     },
+    /// 共享节点列表请求（无需注册，客户端 -> 服务器）
+    #[serde(rename = "community-node-list-request")]
+    CommunityNodeListRequest,
+    /// 共享节点列表响应（服务器 -> 客户端）
+    #[serde(rename = "community-node-list-response")]
+    CommunityNodeListResponse {
+        nodes: Vec<CommunityNodeInfo>,
+    },
+    /// 投稿共享节点（无需注册，客户端 -> 服务器）
+    #[serde(rename = "community-node-submit")]
+    CommunityNodeSubmit {
+        name: String,
+        address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submitter: Option<String>,
+    },
+    /// 投稿结果（服务器 -> 客户端）
+    #[serde(rename = "community-node-submit-result")]
+    CommunityNodeSubmitResult {
+        ok: bool,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<CommunityNodeInfo>,
+    },
 
     /// 通用转发消息（用于文件共享等功能）
     #[serde(other)]
@@ -484,6 +570,31 @@ pub struct PublicLobbyInfo {
     pub server_node: String,
 }
 
+/// 用户投稿的共享 EasyTier 节点
+///
+/// `lastOkAt` 是“最近一次探测成功”的 Unix 秒；`COMMUNITY_NODE_MAX_OFFLINE_SECS`
+/// 就是基于它判断是否淘汰。`online` 只反映最近一轮巡检结果，供客户端展示，
+/// 不参与淘汰判定（避免一次网络抖动就删节点）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityNodeInfo {
+    pub name: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitter: Option<String>,
+    /// 首次投稿时间（Unix 秒）
+    #[serde(rename = "submittedAt", default)]
+    pub submitted_at: u64,
+    /// 最近一次探测成功时间（Unix 秒）
+    #[serde(rename = "lastOkAt", default)]
+    pub last_ok_at: u64,
+    /// 最近一轮巡检是否可达
+    #[serde(default)]
+    pub online: bool,
+    /// 最近一次成功探测的 TCP 握手耗时（毫秒）
+    #[serde(rename = "latencyMs", default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInfo {
     #[serde(rename = "playerId")]
@@ -559,6 +670,12 @@ type Lobbies = Arc<RwLock<HashMap<String, LobbyInfo>>>;
 
 /// 客户端ID到大厅ID的映射
 type ClientLobbyMap = Arc<RwLock<HashMap<String, String>>>;
+
+/// 用户投稿的共享节点注册表（key = 归一化后的地址）
+type CommunityNodes = Arc<RwLock<HashMap<String, CommunityNodeInfo>>>;
+
+/// 投稿限流表：来源 IP -> 最近一次投稿时间（Unix 秒）
+type SubmitCooldowns = Arc<RwLock<HashMap<std::net::IpAddr, u64>>>;
 
 type ClientSender = Arc<RwLock<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>>;
 
@@ -687,6 +804,452 @@ fn is_version_valid(version: &str, minimum_version: &str) -> bool {
     true // 版本相同
 }
 
+// ==================== 投稿共享节点：校验 / 探测 / 持久化 ====================
+
+/// 从节点地址中解析出 (host, port)。
+///
+/// 与桌面端 `parse_node_host_port` 保持同样的默认端口约定，避免两端对
+/// “同一个地址是否可达”得出不同结论。
+fn parse_node_host_port(address: &str) -> Option<(String, u16)> {
+    let trimmed = address.trim();
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((s, r)) => (s.to_lowercase(), r),
+        None => (String::new(), trimmed),
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    if host_port.is_empty() {
+        return None;
+    }
+    let default_port: u16 = match scheme.as_str() {
+        "wss" | "https" => 443,
+        "ws" | "http" => 80,
+        _ => 11010,
+    };
+
+    // IPv6 字面量形如 [::1]:11010
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        let (host, tail) = stripped.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None => default_port,
+        };
+        return Some((host.to_string(), port));
+    }
+
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            if host.is_empty() {
+                return None;
+            }
+            return Some((host.to_string(), port));
+        }
+    }
+    Some((host_port.to_string(), default_port))
+}
+
+/// 校验并归一化投稿地址。
+///
+/// 只接受 EasyTier 支持的协议前缀，并且必须能解析出 host/port，
+/// 归一化结果用作注册表的 key，保证“同一节点写法不同”不会重复入库。
+fn normalize_community_node_address(address: &str) -> Result<String, &'static str> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("节点地址不能为空");
+    }
+    if trimmed.len() > COMMUNITY_NODE_ADDRESS_MAX_LEN {
+        return Err("节点地址过长");
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("节点地址不能包含空白或控制字符");
+    }
+    let (scheme, _) = trimmed.split_once("://").ok_or("节点地址必须以 tcp:// udp:// ws:// wss:// 开头")?;
+    let scheme_lower = scheme.to_lowercase();
+    if !matches!(scheme_lower.as_str(), "tcp" | "udp" | "ws" | "wss") {
+        return Err("节点地址协议不支持，仅支持 tcp:// udp:// ws:// wss://");
+    }
+    let (host, port) = parse_node_host_port(trimmed).ok_or("节点地址无法解析出主机与端口")?;
+    if port == 0 {
+        return Err("节点端口无效");
+    }
+    // 归一化：协议小写 + 主机小写 + 显式端口
+    let rest = trimmed.split_once("://").map(|(_, r)| r).unwrap_or(trimmed);
+    let path = match rest.split_once('/') {
+        Some((_, p)) if !p.is_empty() => format!("/{}", p),
+        _ => String::new(),
+    };
+    let host_lower = host.to_lowercase();
+    let host_part = if host_lower.contains(':') {
+        format!("[{}]", host_lower)
+    } else {
+        host_lower
+    };
+    Ok(format!("{}://{}:{}{}", scheme_lower, host_part, port, path))
+}
+
+/// 清理投稿的展示文本（名称 / 昵称）：去掉控制字符并截断
+fn sanitize_community_text(raw: &str, max_len: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// TCP 握手探测：只有真正建立连接才算存活。
+///
+/// 注意这里**故意不**沿用桌面端 `test_node_latency` 把 `ConnectionRefused`
+/// 当作“可达”的做法。桌面端那样处理是为了给用户展示“主机在线”，而这里的结果
+/// 直接决定节点是否会被淘汰：若把“端口拒绝连接”也算存活，那么 EasyTier 进程挂掉
+/// 之后节点仍会被永久判活，“失效超过 1 天自动移除”就完全不会触发。
+async fn probe_community_node_tcp(host: &str, port: u16) -> Option<u64> {
+    let start = std::time::Instant::now();
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(COMMUNITY_NODE_PROBE_TIMEOUT_SECS),
+        TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_millis() as u64),
+        _ => None,
+    }
+}
+
+/// UDP 探测：仅用于 `udp://` 节点。
+///
+/// UDP 无握手，只能借助 ICMP：已 connect 的 UDP socket 在收到
+/// “port unreachable” 后，下一次 recv 会返回 ConnectionReset/ConnectionRefused，
+/// 据此判定失效。完全没有回包时保守判定存活，避免把只监听 UDP、
+/// 且上游丢弃 ICMP 的正常节点误删。DNS 解析失败则直接判定失效。
+async fn probe_community_node_udp(host: &str, port: u16) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let target = tokio::time::timeout(
+        tokio::time::Duration::from_secs(COMMUNITY_NODE_PROBE_TIMEOUT_SECS),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .next()?;
+    let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+    socket.connect(target).await.ok()?;
+    socket.send(&[0u8; 1]).await.ok()?;
+
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(COMMUNITY_NODE_PROBE_TIMEOUT_SECS),
+        socket.recv(&mut buf),
+    )
+    .await
+    {
+        // 有回包：确定存活
+        Ok(Ok(_)) => Some(start.elapsed().as_millis() as u64),
+        // ICMP 端口不可达：确定失效
+        Ok(Err(_)) => None,
+        // 既无回包也无 ICMP：保守判活
+        Err(_) => Some(start.elapsed().as_millis() as u64),
+    }
+}
+
+/// 探测节点可达性，返回成功时的耗时（毫秒）。
+///
+/// EasyTier 默认会在同一端口同时监听 TCP 与 UDP，因此所有协议都先做 TCP 握手；
+/// 只有 `udp://` 在 TCP 不通时才退化为 UDP 探测。
+async fn probe_community_node(address: &str) -> Option<u64> {
+    let (host, port) = parse_node_host_port(address)?;
+    if let Some(ms) = probe_community_node_tcp(&host, port).await {
+        return Some(ms);
+    }
+    let scheme = address
+        .split_once("://")
+        .map(|(s, _)| s.to_lowercase())
+        .unwrap_or_default();
+    if scheme == "udp" {
+        return probe_community_node_udp(&host, port).await;
+    }
+    None
+}
+
+/// 判断节点是否已失效超过阈值（失效超过 1 天 -> 应移除）
+fn is_community_node_expired(node: &CommunityNodeInfo, now: u64) -> bool {
+    now.saturating_sub(node.last_ok_at) > COMMUNITY_NODE_MAX_OFFLINE_SECS
+}
+
+/// 从磁盘载入投稿节点，顺带剔除已过期条目
+fn load_community_nodes_from_disk(path: &str, now: u64) -> HashMap<String, CommunityNodeInfo> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("读取投稿节点文件失败（{}）：{}", path, e);
+            }
+            return HashMap::new();
+        }
+    };
+    let nodes: Vec<CommunityNodeInfo> = match serde_json::from_str(&raw) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            log::warn!("解析投稿节点文件失败（{}）：{}，按空表启动", path, e);
+            return HashMap::new();
+        }
+    };
+    let mut map = HashMap::new();
+    for node in nodes {
+        let key = match normalize_community_node_address(&node.address) {
+            Ok(key) => key,
+            Err(reason) => {
+                log::warn!("丢弃非法投稿节点 {}：{}", node.address, reason);
+                continue;
+            }
+        };
+        if is_community_node_expired(&node, now) {
+            log::info!("启动清理：投稿节点 {} 失效已超过 1 天，移除", node.address);
+            continue;
+        }
+        map.insert(key, node);
+    }
+    log::info!("已载入 {} 个用户投稿节点（{}）", map.len(), path);
+    map
+}
+
+/// 将投稿节点写回磁盘（先写临时文件再 rename，避免进程被杀时留下半截 JSON）
+async fn persist_community_nodes(nodes: &CommunityNodes) {
+    let snapshot: Vec<CommunityNodeInfo> = {
+        let read = nodes.read().await;
+        let mut list: Vec<CommunityNodeInfo> = read.values().cloned().collect();
+        list.sort_by(|a, b| a.address.cmp(&b.address));
+        list
+    };
+    let path = community_nodes_file().to_string();
+    let json = match serde_json::to_string_pretty(&snapshot) {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("序列化投稿节点失败: {}", e);
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("写入投稿节点文件失败: {}", e),
+        Err(e) => log::warn!("投稿节点持久化任务异常: {}", e),
+    }
+}
+
+/// 取出对客户端可见的投稿节点列表（按在线优先、延迟升序排序）
+async fn community_node_list(nodes: &CommunityNodes) -> Vec<CommunityNodeInfo> {
+    let read = nodes.read().await;
+    let mut list: Vec<CommunityNodeInfo> = read.values().cloned().collect();
+    drop(read);
+    list.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| a.latency_ms.unwrap_or(u64::MAX).cmp(&b.latency_ms.unwrap_or(u64::MAX)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    list
+}
+
+/// 对全部投稿节点做一轮探测，并移除失效超过 1 天的条目。
+///
+/// 返回 (在线数, 移除数)。探测在锁外并发执行，只有回写结果时才短暂持写锁。
+async fn sweep_community_nodes(nodes: &CommunityNodes) -> (usize, usize) {
+    let targets: Vec<String> = {
+        let read = nodes.read().await;
+        read.keys().cloned().collect()
+    };
+    if targets.is_empty() {
+        return (0, 0);
+    }
+
+    let mut results: Vec<(String, Option<u64>)> = Vec::with_capacity(targets.len());
+    for chunk in targets.chunks(COMMUNITY_NODE_PROBE_CONCURRENCY) {
+        let probes = chunk.iter().map(|address| {
+            let address = address.clone();
+            async move {
+                let latency = probe_community_node(&address).await;
+                (address, latency)
+            }
+        });
+        results.extend(join_all(probes).await);
+    }
+
+    let now = now_unix_secs();
+    let mut online = 0usize;
+    let removed;
+    {
+        let mut write = nodes.write().await;
+        for (address, latency) in results {
+            let Some(node) = write.get_mut(&address) else {
+                // 该节点在本轮探测期间被并发移除，跳过
+                continue;
+            };
+            match latency {
+                Some(ms) => {
+                    node.online = true;
+                    node.latency_ms = Some(ms);
+                    node.last_ok_at = now;
+                    online += 1;
+                }
+                None => {
+                    node.online = false;
+                    node.latency_ms = None;
+                }
+            }
+        }
+        let before = write.len();
+        write.retain(|_, node| {
+            let keep = !is_community_node_expired(node, now);
+            if !keep {
+                log::info!(
+                    "投稿节点 {}（{}）失效已超过 1 天，自动移除",
+                    node.name,
+                    node.address
+                );
+            }
+            keep
+        });
+        removed = before - write.len();
+    }
+
+    if removed > 0 {
+        persist_community_nodes(nodes).await;
+    }
+    (online, removed)
+}
+
+/// 后台巡检任务：周期性探测投稿节点并淘汰失效条目
+async fn spawn_community_node_sweeper(nodes: CommunityNodes) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(
+            COMMUNITY_NODE_PROBE_INTERVAL_SECS,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let total = nodes.read().await.len();
+            if total == 0 {
+                continue;
+            }
+            let (online, removed) = sweep_community_nodes(&nodes).await;
+            log::info!(
+                "投稿节点巡检完成：共 {} 个，在线 {} 个，本轮移除 {} 个",
+                total,
+                online,
+                removed
+            );
+        }
+    });
+}
+
+/// 处理一次投稿请求，返回给客户端的结果消息。
+///
+/// 先校验、后探测、再入库：探测不通的节点直接拒绝，避免把死地址写进公共列表。
+async fn handle_community_node_submit(
+    nodes: &CommunityNodes,
+    cooldowns: &SubmitCooldowns,
+    peer: SocketAddr,
+    name: String,
+    address: String,
+    submitter: Option<String>,
+) -> SignalingMessage {
+    let reject = |message: &str| SignalingMessage::CommunityNodeSubmitResult {
+        ok: false,
+        message: message.to_string(),
+        node: None,
+    };
+
+    let normalized = match normalize_community_node_address(&address) {
+        Ok(v) => v,
+        Err(reason) => return reject(reason),
+    };
+    let clean_name = sanitize_community_text(&name, COMMUNITY_NODE_NAME_MAX_LEN);
+    if clean_name.is_empty() {
+        return reject("节点名称不能为空");
+    }
+    let clean_submitter = submitter
+        .map(|s| sanitize_community_text(&s, COMMUNITY_NODE_SUBMITTER_MAX_LEN))
+        .filter(|s| !s.is_empty());
+
+    let now = now_unix_secs();
+
+    // 限流：同一来源 IP 冷却期内只允许投稿一次
+    {
+        let mut write = cooldowns.write().await;
+        write.retain(|_, at| now.saturating_sub(*at) <= COMMUNITY_NODE_SUBMIT_COOLDOWN_SECS);
+        if let Some(last) = write.get(&peer.ip()) {
+            let wait = COMMUNITY_NODE_SUBMIT_COOLDOWN_SECS.saturating_sub(now.saturating_sub(*last));
+            return reject(&format!("投稿过于频繁，请 {} 秒后再试", wait.max(1)));
+        }
+        write.insert(peer.ip(), now);
+    }
+
+    let already_exists = nodes.read().await.contains_key(&normalized);
+    if !already_exists && nodes.read().await.len() >= community_node_capacity() {
+        return reject("共享节点列表已满，请稍后再试");
+    }
+
+    // 投稿即探测：不可达的地址不入库
+    let latency = match probe_community_node(&normalized).await {
+        Some(ms) => ms,
+        None => return reject("该节点当前不可达，请确认地址与端口后重新提交"),
+    };
+
+    let node = {
+        let mut write = nodes.write().await;
+        if let Some(existing) = write.get_mut(&normalized) {
+            // 已存在：刷新存活信息与展示名，不重复占用容量
+            existing.name = clean_name;
+            if clean_submitter.is_some() {
+                existing.submitter = clean_submitter;
+            }
+            existing.online = true;
+            existing.latency_ms = Some(latency);
+            existing.last_ok_at = now;
+            existing.clone()
+        } else {
+            if write.len() >= community_node_capacity() {
+                // 与上面的预检查之间存在并发窗口，这里再兜一次
+                return reject("共享节点列表已满，请稍后再试");
+            }
+            let node = CommunityNodeInfo {
+                name: clean_name,
+                address: normalized.clone(),
+                submitter: clean_submitter,
+                submitted_at: now,
+                last_ok_at: now,
+                online: true,
+                latency_ms: Some(latency),
+            };
+            write.insert(normalized.clone(), node.clone());
+            node
+        }
+    };
+
+    persist_community_nodes(nodes).await;
+    log::info!("✅ 收到投稿共享节点: {} ({}) from {}", node.name, node.address, peer);
+
+    SignalingMessage::CommunityNodeSubmitResult {
+        ok: true,
+        message: if already_exists {
+            "该节点已在共享列表中，已刷新存活状态".to_string()
+        } else {
+            "投稿成功，感谢分享".to_string()
+        },
+        node: Some(node),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // 初始化日志
@@ -706,6 +1269,21 @@ async fn main() {
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
     let client_lobby_map: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
+
+    // 用户投稿的共享节点：从磁盘恢复（顺带剔除失效超过 1 天的条目），并启动后台巡检
+    let community_nodes: CommunityNodes = Arc::new(RwLock::new(load_community_nodes_from_disk(
+        community_nodes_file(),
+        now_unix_secs(),
+    )));
+    let submit_cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+    log::info!(
+        "共享节点：容量上限 {}，巡检周期 {} 秒，失效超过 {} 秒自动移除，存档 {}",
+        community_node_capacity(),
+        COMMUNITY_NODE_PROBE_INTERVAL_SECS,
+        COMMUNITY_NODE_MAX_OFFLINE_SECS,
+        community_nodes_file()
+    );
+    spawn_community_node_sweeper(Arc::clone(&community_nodes)).await;
     
     // 绑定监听地址
     let listener = match TcpListener::bind(&listen_addr).await {
@@ -735,10 +1313,21 @@ async fn main() {
                 
                 let lobbies_clone = Arc::clone(&lobbies);
                 let client_lobby_map_clone = Arc::clone(&client_lobby_map);
+                let community_nodes_clone = Arc::clone(&community_nodes);
+                let submit_cooldowns_clone = Arc::clone(&submit_cooldowns);
                 
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
-                    if let Err(e) = handle_connection(stream, addr, lobbies_clone, client_lobby_map_clone).await {
+                    if let Err(e) = handle_connection(
+                        stream,
+                        addr,
+                        lobbies_clone,
+                        client_lobby_map_clone,
+                        community_nodes_clone,
+                        submit_cooldowns_clone,
+                    )
+                    .await
+                    {
                         log::error!("处理客户端连接失败 ({}): {}", addr, e);
                     }
                 });
@@ -757,12 +1346,16 @@ async fn handle_connection(
     addr: SocketAddr,
     lobbies: Lobbies,
     client_lobby_map: ClientLobbyMap,
+    community_nodes: CommunityNodes,
+    submit_cooldowns: SubmitCooldowns,
 ) -> Result<(), Box<dyn std::error::Error>> {
     handle_connection_with_timeouts(
         stream,
         addr,
         lobbies,
         client_lobby_map,
+        community_nodes,
+        submit_cooldowns,
         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTERED_IDLE_TIMEOUT_SECS),
@@ -770,11 +1363,14 @@ async fn handle_connection(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_timeouts(
     stream: TcpStream,
     addr: SocketAddr,
     lobbies: Lobbies,
     client_lobby_map: ClientLobbyMap,
+    community_nodes: CommunityNodes,
+    submit_cooldowns: SubmitCooldowns,
     handshake_timeout: tokio::time::Duration,
     registration_timeout: tokio::time::Duration,
     idle_timeout: tokio::time::Duration,
@@ -1706,6 +2302,34 @@ async fn handle_connection_with_timeouts(
                                         send_text(&write, json).await;
                                     }
                                 }
+                                SignalingMessage::CommunityNodeListRequest => {
+                                    // 共享节点列表：与公开广场一致，无需注册即可查询
+                                    log::info!("🌐 收到共享节点列表请求 from {}", addr);
+                                    let nodes = community_node_list(&community_nodes).await;
+                                    let resp = SignalingMessage::CommunityNodeListResponse { nodes };
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        send_text(&write, json).await;
+                                    }
+                                }
+                                SignalingMessage::CommunityNodeSubmit { name, address, submitter } => {
+                                    // 投稿共享节点：无需注册（用户可能还没进大厅就想分享节点）
+                                    let resp = handle_community_node_submit(
+                                        &community_nodes,
+                                        &submit_cooldowns,
+                                        addr,
+                                        name,
+                                        address,
+                                        submitter,
+                                    )
+                                    .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        send_text(&write, json).await;
+                                    }
+                                }
+                                SignalingMessage::CommunityNodeListResponse { .. }
+                                | SignalingMessage::CommunityNodeSubmitResult { .. } => {
+                                    // 服务器 -> 客户端方向的消息，客户端不应发送，忽略即可
+                                }
                                 SignalingMessage::KickPlayer { from, target } => {
                                     if !is_registered {
                                         log::warn!("🚫 未注册客户端尝试踢人，拒绝: {}", addr);
@@ -2218,6 +2842,8 @@ mod tests {
         let address = listener.local_addr().expect("test listener address");
         let lobbies = Arc::new(RwLock::new(HashMap::new()));
         let client_lobby_map = Arc::new(RwLock::new(HashMap::new()));
+        let community_nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let submit_cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
         let server_task = tokio::spawn(async move {
             let (stream, addr) = listener.accept().await.expect("accept test client");
             handle_connection_with_timeouts(
@@ -2225,6 +2851,8 @@ mod tests {
                 addr,
                 lobbies,
                 client_lobby_map,
+                community_nodes,
+                submit_cooldowns,
                 tokio::time::Duration::from_secs(1),
                 registration_timeout,
                 tokio::time::Duration::from_secs(300),
@@ -2361,6 +2989,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
         let client_lobby_map: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
+        let community_nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let submit_cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
 
         let task = tokio::spawn(async move {
             loop {
@@ -2369,12 +2999,16 @@ mod tests {
                 };
                 let lobbies = Arc::clone(&lobbies);
                 let client_lobby_map = Arc::clone(&client_lobby_map);
+                let community_nodes = Arc::clone(&community_nodes);
+                let submit_cooldowns = Arc::clone(&submit_cooldowns);
                 tokio::spawn(async move {
                     let _ = handle_connection_with_timeouts(
                         stream,
                         peer,
                         lobbies,
                         client_lobby_map,
+                        community_nodes,
+                        submit_cooldowns,
                         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
                         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
                         idle_timeout,
@@ -2728,4 +3362,388 @@ mod tests {
 
         server.abort();
     }
-}
+
+    // ==================== 用户投稿共享节点 ====================
+
+
+    fn node_at(address: &str, last_ok_at: u64) -> CommunityNodeInfo {
+        CommunityNodeInfo {
+            name: "测试节点".to_string(),
+            address: address.to_string(),
+            submitter: None,
+            submitted_at: last_ok_at,
+            last_ok_at,
+            online: false,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn community_address_normalization_dedupes_equivalent_spellings() {
+        let a = normalize_community_node_address("TCP://Example.COM:11010").unwrap();
+        let b = normalize_community_node_address("  tcp://example.com:11010 ").unwrap();
+        assert_eq!(a, b, "大小写与空白差异必须归一化为同一个 key");
+        assert_eq!(a, "tcp://example.com:11010");
+
+        // 缺省端口按协议补齐，确保 tcp://host 与 tcp://host:11010 视为同一节点
+        assert_eq!(
+            normalize_community_node_address("tcp://example.com").unwrap(),
+            "tcp://example.com:11010"
+        );
+        assert_eq!(
+            normalize_community_node_address("wss://example.com").unwrap(),
+            "wss://example.com:443"
+        );
+        assert_eq!(
+            normalize_community_node_address("wss://example.com/signaling").unwrap(),
+            "wss://example.com:443/signaling"
+        );
+        assert_eq!(
+            normalize_community_node_address("udp://[2001:db8::1]:11010").unwrap(),
+            "udp://[2001:db8::1]:11010"
+        );
+    }
+
+    #[test]
+    fn community_address_rejects_unsupported_and_malformed_input() {
+        for bad in [
+            "",
+            "   ",
+            "example.com:11010",
+            "http://example.com",
+            "file:///etc/passwd",
+            "tcp://",
+            "tcp://例子.com:0",
+            "tcp://exa mple.com:11010",
+        ] {
+            assert!(
+                normalize_community_node_address(bad).is_err(),
+                "应拒绝非法地址: {:?}",
+                bad
+            );
+        }
+        assert!(
+            normalize_community_node_address(&format!("tcp://{}.com:11010", "a".repeat(200)))
+                .is_err(),
+            "超长地址应被拒绝"
+        );
+    }
+
+    #[test]
+    fn community_text_sanitizer_strips_controls_and_truncates() {
+        assert_eq!(sanitize_community_text("  节点\u{0007}名  ", 32), "节点名");
+        assert_eq!(sanitize_community_text("abcdef", 3), "abc");
+        assert_eq!(sanitize_community_text("\n\t ", 32), "");
+    }
+
+    #[test]
+    fn community_node_expires_only_after_one_full_day_offline() {
+        let now = 10 * COMMUNITY_NODE_MAX_OFFLINE_SECS;
+        // 恰好 1 天未成功：仍保留（需求是“超过 1 天”才移除）
+        let boundary = node_at("tcp://a.example:11010", now - COMMUNITY_NODE_MAX_OFFLINE_SECS);
+        assert!(!is_community_node_expired(&boundary, now));
+        // 超过 1 天：移除
+        let expired = node_at(
+            "tcp://b.example:11010",
+            now - COMMUNITY_NODE_MAX_OFFLINE_SECS - 1,
+        );
+        assert!(is_community_node_expired(&expired, now));
+        // 刚探测成功
+        assert!(!is_community_node_expired(&node_at("tcp://c.example:11010", now), now));
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_long_dead_nodes_and_refreshes_live_ones() {
+        // 本地监听器充当“存活节点”，探测必然成功
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let live = format!("tcp://{}:{}", live_addr.ip(), live_addr.port());
+        let live_key = normalize_community_node_address(&live).unwrap();
+
+        // 未监听的端口 -> 探测失败；用足够久的 last_ok_at 触发淘汰
+        let dead_key = normalize_community_node_address("tcp://127.0.0.1:9").unwrap();
+        let now = now_unix_secs();
+
+        let mut map = HashMap::new();
+        map.insert(live_key.clone(), node_at(&live_key, now - 10 * COMMUNITY_NODE_MAX_OFFLINE_SECS));
+        map.insert(
+            dead_key.clone(),
+            node_at(&dead_key, now - COMMUNITY_NODE_MAX_OFFLINE_SECS - 60),
+        );
+        let nodes: CommunityNodes = Arc::new(RwLock::new(map));
+
+        let (online, removed) = sweep_community_nodes(&nodes).await;
+        assert_eq!(online, 1, "只有本地监听器应探测成功");
+        assert_eq!(removed, 1, "失效超过 1 天的节点应被移除");
+
+        let read = nodes.read().await;
+        assert!(!read.contains_key(&dead_key), "死节点必须被移除");
+        let refreshed = read.get(&live_key).expect("存活节点应保留");
+        assert!(refreshed.online);
+        assert!(refreshed.latency_ms.is_some());
+        assert!(
+            refreshed.last_ok_at >= now,
+            "探测成功必须刷新 last_ok_at，否则存活节点会被误删"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_recently_alive_node_that_is_currently_unreachable() {
+        // 刚掉线（未超过 1 天）的节点应保留，只把 online 标记为 false
+        let dead_key = normalize_community_node_address("tcp://127.0.0.1:9").unwrap();
+        let now = now_unix_secs();
+        let mut node = node_at(&dead_key, now - 60);
+        node.online = true;
+        node.latency_ms = Some(12);
+        let mut map = HashMap::new();
+        map.insert(dead_key.clone(), node);
+        let nodes: CommunityNodes = Arc::new(RwLock::new(map));
+
+        let (online, removed) = sweep_community_nodes(&nodes).await;
+        assert_eq!(online, 0);
+        assert_eq!(removed, 0, "短暂不可达不应立刻删除");
+        let read = nodes.read().await;
+        let kept = read.get(&dead_key).expect("节点应保留");
+        assert!(!kept.online);
+        assert!(kept.latency_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_unreachable_node_and_accepts_live_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let live = format!("tcp://{}:{}", live_addr.ip(), live_addr.port());
+
+        let nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+
+        // 不可达地址：直接拒绝，不入库
+        let peer_a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let resp = handle_community_node_submit(
+            &nodes,
+            &cooldowns,
+            peer_a,
+            "死节点".to_string(),
+            "tcp://127.0.0.1:9".to_string(),
+            None,
+        )
+        .await;
+        match resp {
+            SignalingMessage::CommunityNodeSubmitResult { ok, node, .. } => {
+                assert!(!ok);
+                assert!(node.is_none());
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert!(nodes.read().await.is_empty(), "不可达节点不得入库");
+
+        // 可达地址：入库，并带上首次投稿时间
+        let peer_b: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let resp = handle_community_node_submit(
+            &nodes,
+            &cooldowns,
+            peer_b,
+            "  活节点\u{0007}  ".to_string(),
+            live.to_uppercase(),
+            Some("玩家A".to_string()),
+        )
+        .await;
+        match resp {
+            SignalingMessage::CommunityNodeSubmitResult { ok, node, .. } => {
+                assert!(ok);
+                let node = node.expect("成功时应回传节点");
+                assert_eq!(node.name, "活节点", "名称需清理控制字符与空白");
+                assert_eq!(node.submitter.as_deref(), Some("玩家A"));
+                assert!(node.online);
+                assert!(node.last_ok_at > 0);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(nodes.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_is_rate_limited_per_source_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let live = format!("tcp://{}:{}", live_addr.ip(), live_addr.port());
+
+        let nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+        let peer: SocketAddr = "10.0.0.3:5000".parse().unwrap();
+
+        let first = handle_community_node_submit(
+            &nodes,
+            &cooldowns,
+            peer,
+            "节点1".to_string(),
+            live.clone(),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            first,
+            SignalingMessage::CommunityNodeSubmitResult { ok: true, .. }
+        ));
+
+        // 同一 IP 立刻再投稿：应被冷却拒绝
+        let second = handle_community_node_submit(
+            &nodes,
+            &cooldowns,
+            peer,
+            "节点2".to_string(),
+            live.clone(),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            second,
+            SignalingMessage::CommunityNodeSubmitResult { ok: false, .. }
+        ));
+
+        // 换一个 IP 提交同一地址：视为刷新而非新增
+        let other_peer: SocketAddr = "10.0.0.4:5000".parse().unwrap();
+        let third = handle_community_node_submit(
+            &nodes,
+            &cooldowns,
+            other_peer,
+            "节点1改名".to_string(),
+            live,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            third,
+            SignalingMessage::CommunityNodeSubmitResult { ok: true, .. }
+        ));
+        assert_eq!(nodes.read().await.len(), 1, "同一地址不得重复入库");
+        assert_eq!(
+            nodes.read().await.values().next().unwrap().name,
+            "节点1改名"
+        );
+    }
+
+    #[test]
+    fn loading_from_disk_drops_expired_and_invalid_entries() {
+        let now = 10 * COMMUNITY_NODE_MAX_OFFLINE_SECS;
+        let dir = std::env::temp_dir().join(format!("mctier-nodes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("community_nodes.json");
+
+        let payload = serde_json::json!([
+            { "name": "存活", "address": "tcp://keep.example:11010", "lastOkAt": now - 60 },
+            { "name": "过期", "address": "tcp://drop.example:11010",
+              "lastOkAt": now - COMMUNITY_NODE_MAX_OFFLINE_SECS - 1 },
+            { "name": "非法", "address": "not-a-node", "lastOkAt": now }
+        ]);
+        std::fs::write(&path, payload.to_string()).unwrap();
+
+        let loaded = load_community_nodes_from_disk(path.to_str().unwrap(), now);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("tcp://keep.example:11010"));
+
+        // 文件缺失 / 内容损坏时都应回退为空表而不是 panic
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_community_nodes_from_disk(path.to_str().unwrap(), now).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_community_nodes_from_disk(
+            dir.join("missing.json").to_str().unwrap(),
+            now
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn community_node_list_sorts_online_first_then_by_latency() {
+        let now = now_unix_secs();
+        let mut map = HashMap::new();
+        let mut offline = node_at("tcp://offline.example:11010", now);
+        offline.name = "离线".to_string();
+        let mut slow = node_at("tcp://slow.example:11010", now);
+        slow.name = "慢".to_string();
+        slow.online = true;
+        slow.latency_ms = Some(300);
+        let mut fast = node_at("tcp://fast.example:11010", now);
+        fast.name = "快".to_string();
+        fast.online = true;
+        fast.latency_ms = Some(20);
+        map.insert(offline.address.clone(), offline);
+        map.insert(slow.address.clone(), slow);
+        map.insert(fast.address.clone(), fast);
+
+        let list = community_node_list(&Arc::new(RwLock::new(map))).await;
+        let names: Vec<&str> = list.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["快", "慢", "离线"]);
+    }
+
+    #[tokio::test]
+    async fn unregistered_client_can_query_and_submit_community_nodes() {
+        // 与公开广场一致：这两条消息在注册之前也必须被服务
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+        let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
+        let client_lobby_map: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_connection_with_timeouts(
+                stream,
+                peer,
+                lobbies,
+                client_lobby_map,
+                nodes,
+                cooldowns,
+                tokio::time::Duration::from_secs(5),
+                tokio::time::Duration::from_secs(5),
+                tokio::time::Duration::from_secs(30),
+            )
+            .await;
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{}", address)).await.unwrap();
+        client
+            .send(Message::Text(
+                serde_json::json!({ "type": "community-node-list-request" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        let list = next_json(&mut client).await;
+        assert_eq!(list["type"], "community-node-list-response");
+        assert_eq!(list["nodes"].as_array().unwrap().len(), 0);
+
+        // 未注册连接投稿一个不可达地址：应收到失败结果而不是被直接断开。
+        // 这里不能用 next_json（2 秒上界）：服务器要先真实探测该地址，
+        // Windows 上对被拒绝端口的 connect 会重试到 2 秒以上，
+        // 因此按探测超时给足等待时间。
+        client
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "community-node-submit",
+                    "name": "死节点",
+                    "address": "tcp://127.0.0.1:9"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let frame = timeout(
+            Duration::from_secs(COMMUNITY_NODE_PROBE_TIMEOUT_SECS + 5),
+            client.next(),
+        )
+        .await
+        .expect("投稿结果应在探测超时内返回")
+        .expect("连接不应被关闭")
+        .expect("不应收到 WebSocket 错误");
+        let result: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(result["type"], "community-node-submit-result");
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["message"].as_str().unwrap().contains("不可达"),
+            "应说明原因: {}",
+            result["message"]
+        );
+
+        server.abort();
+    }}

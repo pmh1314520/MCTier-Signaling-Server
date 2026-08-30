@@ -14,6 +14,11 @@ services:
       - MINIMUM_CLIENT_VERSION=${MINIMUM_CLIENT_VERSION:-2.1.0}
       - CLIENT_DOWNLOAD_URL=${CLIENT_DOWNLOAD_URL:-https://github.com/pmh1314520/MCTier/releases}
       - MAX_CONNECTIONS=${MAX_CONNECTIONS:-1024}
+      - COMMUNITY_NODES_FILE=/app/data/community_nodes.json
+      - COMMUNITY_NODE_CAPACITY=${COMMUNITY_NODE_CAPACITY:-200}
+    # 用户投稿的共享节点存档：用命名卷持久化，容器重建后投稿不丢失
+    volumes:
+      - mctier-signaling-data:/app/data
     logging:
       driver: "json-file"
       options:
@@ -25,6 +30,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+volumes:
+  mctier-signaling-data:
 
 networks:
   default:

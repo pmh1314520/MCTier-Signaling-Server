@@ -34,6 +34,10 @@ logs/
 Thumbs.db
 desktop.ini
 
+# 用户投稿共享节点的运行时存档（由服务器生成，不入库）
+community_nodes.json
+community_nodes.json.tmp
+
 # 临时文件
 *.tmp
 *.bak
