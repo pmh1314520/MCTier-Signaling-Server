@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{accept_async_with_config, tungstenite::Message};
 
 /// 默认要求的最低客户端版本（可通过环境变量 MINIMUM_CLIENT_VERSION 覆盖）
-const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "2.1.0";
+const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "3.0.0";
 
 /// 默认监听地址（可通过环境变量 BIND_ADDRESS 覆盖）
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8445";
@@ -57,7 +57,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const REGISTERED_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// 版本过低时提示客户端的下载地址（可通过环境变量 CLIENT_DOWNLOAD_URL 覆盖）
-const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://github.com/pmh1314520/MCTier/releases";
+const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://mctier.pmhs.top";
 
 // ==================== 用户投稿的共享节点 ====================
 
@@ -3655,12 +3655,44 @@ mod tests {
         assert_eq!(config.max_frame_size, Some(256 * 1024));
     }
 
+    /// 测试用客户端版本：直接取当前门槛值，避免写死字面量。
+    /// 此前各处硬编码 "2.1.0" / "2.7.5"，门槛一提高就会有一批测试因为
+    /// 「版本过低」集体失败，而失败原因与被测逻辑无关，属于噪音。
+    const TEST_CLIENT_VERSION: &str = DEFAULT_MINIMUM_CLIENT_VERSION;
+
     #[test]
     fn version_gate_rejects_partial_or_malformed_versions() {
         assert!(is_version_valid("2.8.0", "2.1.0"));
         assert!(!is_version_valid("999.invalid", "2.1.0"));
         assert!(!is_version_valid("2.1", "2.1.0"));
         assert!(!is_version_valid("2.1.0.1", "2.1.0"));
+    }
+
+    /// 门槛提到 3.0.0 后，2.x 客户端必须被拒、3.0.0 及以上必须放行。
+    /// 这条固定住「最低版本要求」这个产品决策本身，而不只是比较函数的行为。
+    #[test]
+    fn minimum_client_version_blocks_pre_3_clients() {
+        assert_eq!(DEFAULT_MINIMUM_CLIENT_VERSION, "3.0.0");
+
+        // 低于门槛：一律拒绝
+        for old in ["1.0.0", "2.0.0", "2.1.0", "2.7.5", "2.8.0", "2.9.9"] {
+            assert!(
+                !is_version_valid(old, DEFAULT_MINIMUM_CLIENT_VERSION),
+                "client {old} must be rejected"
+            );
+        }
+
+        // 达到或高于门槛：放行
+        for ok in ["3.0.0", "3.0.1", "3.1.0", "4.0.0"] {
+            assert!(
+                is_version_valid(ok, DEFAULT_MINIMUM_CLIENT_VERSION),
+                "client {ok} must be allowed"
+            );
+        }
+
+        // 未提供版本号的客户端也必须被拒（注册分支里 "unknown" 直接判负）
+        assert!(!is_version_valid("unknown", DEFAULT_MINIMUM_CLIENT_VERSION));
+        assert!(!is_version_valid("", DEFAULT_MINIMUM_CLIENT_VERSION));
     }
 
     #[test]
@@ -3826,7 +3858,7 @@ mod tests {
             use_domain: None,
             lobby_name: "test-lobby".to_string(),
             lobby_password: "test-password".to_string(),
-            client_version: Some("2.1.0".to_string()),
+            client_version: Some(TEST_CLIENT_VERSION.to_string()),
             chat_public_key: None,
         };
         client
@@ -4022,7 +4054,7 @@ mod tests {
                 "virtualIp": virtual_ip,
                 "lobbyName": lobby_name,
                 "lobbyPassword": lobby_password,
-                "clientVersion": "2.7.5"
+                "clientVersion": TEST_CLIENT_VERSION
             })
             .to_string(),
         )
@@ -4041,7 +4073,7 @@ mod tests {
                 "virtualIp": test_virtual_ip(client_id),
                 "lobbyName": lobby_name,
                 "lobbyPassword": "password",
-                "clientVersion": "2.7.5",
+                "clientVersion": TEST_CLIENT_VERSION,
                 "chatPublicKey": chat_public_key
             })
             .to_string(),

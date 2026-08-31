@@ -79,8 +79,8 @@ docker compose -f docker-compose-http.yml logs -f
 | --- | --- | --- |
 | `BIND_ADDRESS` | `0.0.0.0:8445` | 监听地址和端口 |
 | `RUST_LOG` | `info` | 日志级别：`error`/`warn`/`info`/`debug`/`trace` |
-| `MINIMUM_CLIENT_VERSION` | `2.1.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
-| `CLIENT_DOWNLOAD_URL` | MCTier Releases 页面 | 版本过低时提示给客户端的下载地址 |
+| `MINIMUM_CLIENT_VERSION` | `3.0.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
+| `CLIENT_DOWNLOAD_URL` | MCTier 官网 | 版本过低时提示给客户端的下载地址 |
 | `MAX_CONNECTIONS` | `1024` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
 | `COMMUNITY_NODES_FILE` | `community_nodes.json` | 用户投稿共享节点的存档路径。Docker 部署下为 `/app/data/community_nodes.json`，已挂载命名卷，容器重建后投稿不丢失 |
 | `COMMUNITY_NODE_CAPACITY` | `200` | 共享节点列表容量上限 |

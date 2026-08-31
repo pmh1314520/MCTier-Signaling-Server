@@ -13,8 +13,8 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - BIND_ADDRESS=0.0.0.0:8445
-      - MINIMUM_CLIENT_VERSION=${MINIMUM_CLIENT_VERSION:-2.1.0}
-      - CLIENT_DOWNLOAD_URL=${CLIENT_DOWNLOAD_URL:-https://github.com/pmh1314520/MCTier/releases}
+      - MINIMUM_CLIENT_VERSION=${MINIMUM_CLIENT_VERSION:-3.0.0}
+      - CLIENT_DOWNLOAD_URL=${CLIENT_DOWNLOAD_URL:-https://mctier.pmhs.top}
       - MAX_CONNECTIONS=${MAX_CONNECTIONS:-1024}
       - COMMUNITY_NODES_FILE=/app/data/community_nodes.json
       - COMMUNITY_NODE_CAPACITY=${COMMUNITY_NODE_CAPACITY:-200}
