@@ -1,13 +1,19 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{future::join_all, SinkExt, StreamExt};
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::pkcs8::DecodePublicKey;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, RwLock, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{accept_async_with_config, tungstenite::Message};
 
@@ -39,10 +45,32 @@ const MAX_LOBBY_NAME_LEN: usize = 128;
 const MAX_LOBBY_PASSWORD_LEN: usize = 256;
 const MAX_VIRTUAL_DOMAIN_LEN: usize = 253;
 const MAX_CLIENT_VERSION_LEN: usize = 32;
+const SIGNALING_PROTOCOL_VERSION: u32 = 3;
+const CHALLENGE_BYTES: usize = 32;
+const MAX_IDENTITY_PUBLIC_KEY_LEN: usize = 512;
+const MAX_IDENTITY_SIGNATURE_LEN: usize = 256;
+const MAX_SDP_LEN: usize = 128 * 1024;
+const MAX_ICE_CANDIDATE_LEN: usize = 16 * 1024;
+const MAX_CONTROL_TEXT_LEN: usize = 8 * 1024;
+const MAX_MESSAGES_PER_WINDOW: u32 = 120;
+const MESSAGE_RATE_WINDOW_SECS: u64 = 10;
+const MAX_TRACKED_IP_MESSAGE_LIMITERS: usize = 8192;
+const DEFAULT_MAX_CONNECTIONS_PER_IPV4: usize = 8;
+const MAX_OUTBOUND_FRAMES_PER_WINDOW: u32 = 64;
+const MAX_OUTBOUND_BYTES_PER_WINDOW: usize = 1024 * 1024;
+const OUTBOUND_BUDGET_WINDOW_SECS: u64 = 1;
+const COMMUNITY_NODE_SUBMIT_MAX_PER_WINDOW: u32 = 8;
+const COMMUNITY_NODE_SUBMIT_WINDOW_SECS: u64 = 10 * 60;
+const MAX_TRACKED_IP_SUBMITTERS: usize = 8192;
+const COMMUNITY_NODE_PROBE_QUEUE_TIMEOUT_SECS: u64 = 1;
+const MAX_REMOTE_SESSION_ID_LEN: usize = 128;
+const MAX_SHARE_ID_LEN: usize = 128;
+const MAX_SHARE_NAME_LEN: usize = 256;
+const MAX_ERROR_TEXT_LEN: usize = 512;
 
 /// 聊天签名公钥（X.509 SubjectPublicKeyInfo DER 的 base64）长度上限。
 /// 未压缩 P-256 公钥 DER 为 91 字节，base64 后约 124 字符，留出余量后仍能
-/// 拦住任何异常大的值——服务器只做长度与字符集校验，不解析密钥本身。
+/// 拦住任何异常大的值；注册时还会在 P-256 解析阶段验证其密码学有效性。
 const MAX_CHAT_PUBLIC_KEY_LEN: usize = 512;
 
 /// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
@@ -146,7 +174,39 @@ fn now_unix_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SignalingMessage {
-    /// 注册客户端
+    /// 服务端在连接建立后立即下发的一次性注册挑战。
+    ServerChallenge {
+        challenge: String,
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u32,
+    },
+    /// 协议 v3 注册。身份由 identityPublicKey 的 SHA-256 指纹派生，客户端
+    /// 不能再自行选择 clientId。
+    #[serde(rename = "register-v3")]
+    RegisterV3 {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u32,
+        #[serde(rename = "identityPublicKey")]
+        identity_public_key: String,
+        #[serde(rename = "challengeSignature")]
+        challenge_signature: String,
+        #[serde(rename = "playerName")]
+        player_name: String,
+        #[serde(rename = "virtualIp", skip_serializing_if = "Option::is_none")]
+        virtual_ip: Option<String>,
+        #[serde(rename = "lobbyName")]
+        lobby_name: String,
+        #[serde(rename = "lobbyPassword")]
+        lobby_password: String,
+        #[serde(rename = "clientVersion", skip_serializing_if = "Option::is_none")]
+        client_version: Option<String>,
+        #[serde(rename = "virtualDomain", skip_serializing_if = "Option::is_none")]
+        virtual_domain: Option<String>,
+        #[serde(rename = "useDomain", skip_serializing_if = "Option::is_none")]
+        use_domain: Option<bool>,
+    },
+    /// 旧协议注册消息。仅为返回明确的迁移错误而保留，绝不进入注册流程。
+    #[serde(rename = "register")]
     Register {
         #[serde(rename = "clientId")]
         client_id: String,
@@ -164,13 +224,15 @@ pub enum SignalingMessage {
         lobby_password: String,
         #[serde(rename = "clientVersion", skip_serializing_if = "Option::is_none")]
         client_version: Option<String>,
-        /// 该成员的聊天签名公钥。只有公钥经过服务器，私钥永不离开客户端；
-        /// 服务器把它当作与 clientId 绑定的不透明凭据转发给其他成员。
         #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
         chat_public_key: Option<String>,
     },
     /// 注册成功
     RegisterSuccess {
+        #[serde(rename = "clientId")]
+        client_id: String,
+        #[serde(rename = "sessionGeneration")]
+        session_generation: u64,
         #[serde(rename = "lobbyId")]
         lobby_id: String,
         #[serde(rename = "hostId", skip_serializing_if = "Option::is_none")]
@@ -216,6 +278,9 @@ pub enum SignalingMessage {
     },
     /// 玩家列表
     PlayersList { players: Vec<PlayerInfo> },
+    /// 当前连接请求一次权威成员快照；不会触发第二次注册。
+    #[serde(rename = "players-list-request")]
+    PlayersListRequest,
     /// 玩家加入
     PlayerJoined {
         #[serde(rename = "playerId")]
@@ -231,11 +296,15 @@ pub enum SignalingMessage {
         /// 与 players-list 同源的聊天签名公钥，保证增量事件也带齐验签材料。
         #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
         chat_public_key: Option<String>,
+        #[serde(rename = "sessionGeneration")]
+        session_generation: u64,
     },
     /// 玩家离开
     PlayerLeft {
         #[serde(rename = "playerId")]
         player_id: String,
+        #[serde(rename = "sessionGeneration")]
+        session_generation: u64,
     },
     /// WebRTC Offer
     Offer {
@@ -425,6 +494,75 @@ pub enum SignalingMessage {
         to: String,
         shares: Vec<FileShareInfo>,
     },
+    /// 文件共享状态更新。显式建模，禁止通过 wildcard Forward 注入任意 JSON。
+    #[serde(rename = "share-updated")]
+    ShareUpdated {
+        from: String,
+        #[serde(rename = "shareId")]
+        share_id: String,
+        #[serde(rename = "shareName", skip_serializing_if = "Option::is_none")]
+        share_name: Option<String>,
+        #[serde(rename = "playerName", skip_serializing_if = "Option::is_none")]
+        player_name: Option<String>,
+        #[serde(rename = "hasPassword", skip_serializing_if = "Option::is_none")]
+        has_password: Option<bool>,
+    },
+    /// 远程控制信令全部使用显式 schema，并且每一种消息都带 from。
+    #[serde(rename = "remote-control-request")]
+    RemoteControlRequest {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "fromName")]
+        from_name: String,
+    },
+    #[serde(rename = "remote-control-accept")]
+    RemoteControlAccept {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    #[serde(rename = "remote-control-reject")]
+    RemoteControlReject {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        reason: String,
+    },
+    #[serde(rename = "remote-control-offer")]
+    RemoteControlOffer {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        offer: OfferData,
+    },
+    #[serde(rename = "remote-control-answer")]
+    RemoteControlAnswer {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        answer: AnswerData,
+    },
+    #[serde(rename = "remote-control-ice")]
+    RemoteControlIce {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        candidate: CandidateData,
+    },
+    #[serde(rename = "remote-control-stop")]
+    RemoteControlStop {
+        from: String,
+        to: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     /// 心跳检测 ping（客户端 -> 服务器）
     Ping,
     /// 心跳检测 pong（服务器 -> 客户端）
@@ -510,10 +648,6 @@ pub enum SignalingMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<CommunityNodeInfo>,
     },
-
-    /// 通用转发消息（用于文件共享等功能）
-    #[serde(other)]
-    Forward,
 }
 
 impl SignalingMessage {
@@ -522,7 +656,7 @@ impl SignalingMessage {
     /// The WebSocket connection is the authentication boundary. Callers must
     /// compare this value with the id registered on that same connection before
     /// routing or authorizing the message.
-    fn claimed_sender(&self, raw: &str) -> Option<String> {
+    fn claimed_sender(&self, _raw: &str) -> Option<String> {
         match self {
             Self::Offer { from, .. }
             | Self::Answer { from, .. }
@@ -543,6 +677,14 @@ impl SignalingMessage {
             | Self::FileShareRemoved { from, .. }
             | Self::FileShareListRequest { from }
             | Self::FileShareListResponse { from, .. }
+            | Self::ShareUpdated { from, .. }
+            | Self::RemoteControlRequest { from, .. }
+            | Self::RemoteControlAccept { from, .. }
+            | Self::RemoteControlReject { from, .. }
+            | Self::RemoteControlOffer { from, .. }
+            | Self::RemoteControlAnswer { from, .. }
+            | Self::RemoteControlIce { from, .. }
+            | Self::RemoteControlStop { from, .. }
             | Self::KickPlayer { from, .. }
             | Self::MutePlayer { from, .. }
             | Self::TransferHost { from, .. }
@@ -550,11 +692,6 @@ impl SignalingMessage {
             Self::StatusUpdate { client_id, .. } | Self::Leave { client_id } => {
                 Some(client_id.clone())
             }
-            Self::Forward => serde_json::from_str::<serde_json::Value>(raw)
-                .ok()?
-                .get("from")?
-                .as_str()
-                .map(str::to_owned),
             _ => None,
         }
     }
@@ -629,6 +766,8 @@ pub struct PlayerInfo {
     /// 数据包源 IP 判断消息作者——虚拟 IP 可被同大厅成员伪造，公钥不能。
     #[serde(rename = "chatPublicKey", skip_serializing_if = "Option::is_none")]
     pub chat_public_key: Option<String>,
+    #[serde(rename = "sessionGeneration")]
+    pub session_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,9 +801,9 @@ struct ClientInfo {
     virtual_ip: Option<String>,
     virtual_domain: Option<String>,
     use_domain: Option<bool>,
-    /// 注册时提交的聊天签名公钥。绑定在这里意味着它只能随该连接的注册身份
-    /// 进入名册，别的成员无法替它声明或改写。
+    /// 协议 v3 身份公钥，同时用于 P2P 聊天请求验签。
     chat_public_key: Option<String>,
+    session_generation: u64,
     sender: ClientSender,
     disconnect: watch::Sender<bool>,
 }
@@ -688,7 +827,7 @@ struct LobbyInfo {
     /// 房主使用的 EasyTier 节点地址（公开大厅时下发给加入者，保证节点一致可互通）
     server_node: String,
     /// 被禁言的客户端ID集合
-    muted: std::collections::HashSet<String>,
+    muted: HashSet<String>,
     /// CSPRNG credential shared by active members for the P2P chat service.
     /// The lobby entry is destroyed when its last member leaves, so the next
     /// incarnation receives a fresh token.
@@ -708,9 +847,76 @@ type CommunityNodes = Arc<RwLock<HashMap<String, CommunityNodeInfo>>>;
 /// 投稿限流表：来源 IP -> 最近一次投稿时间（Unix 秒）
 type SubmitCooldowns = Arc<RwLock<HashMap<std::net::IpAddr, u64>>>;
 
-type ClientSender = Arc<
-    RwLock<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>,
->;
+#[derive(Debug)]
+struct SubmitQuota {
+    window_started: tokio::time::Instant,
+    submissions: u32,
+}
+
+fn allow_submit_quota(quota: &mut SubmitQuota) -> bool {
+    if quota.window_started.elapsed()
+        >= tokio::time::Duration::from_secs(COMMUNITY_NODE_SUBMIT_WINDOW_SECS)
+    {
+        quota.window_started = tokio::time::Instant::now();
+        quota.submissions = 0;
+    }
+    if quota.submissions >= COMMUNITY_NODE_SUBMIT_MAX_PER_WINDOW {
+        return false;
+    }
+    quota.submissions += 1;
+    true
+}
+
+type SubmitQuotas = Arc<Mutex<HashMap<std::net::IpAddr, SubmitQuota>>>;
+type ProbeLimiter = Arc<Semaphore>;
+type IpMessageLimiters = Arc<Mutex<HashMap<std::net::IpAddr, MessageRateLimiter>>>;
+type IpConnectionCounts = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+#[derive(Debug)]
+struct OutboundBudget {
+    window_started: tokio::time::Instant,
+    frames: u32,
+    bytes: usize,
+}
+
+impl OutboundBudget {
+    fn new() -> Self {
+        Self {
+            window_started: tokio::time::Instant::now(),
+            frames: 0,
+            bytes: 0,
+        }
+    }
+
+    fn allow(&mut self, bytes: usize) -> bool {
+        if self.window_started.elapsed()
+            >= tokio::time::Duration::from_secs(OUTBOUND_BUDGET_WINDOW_SECS)
+        {
+            self.window_started = tokio::time::Instant::now();
+            self.frames = 0;
+            self.bytes = 0;
+        }
+        if bytes > MAX_OUTBOUND_BYTES_PER_WINDOW
+            || self.frames >= MAX_OUTBOUND_FRAMES_PER_WINDOW
+            || self.bytes.saturating_add(bytes) > MAX_OUTBOUND_BYTES_PER_WINDOW
+        {
+            return false;
+        }
+        self.frames += 1;
+        self.bytes += bytes;
+        true
+    }
+}
+
+#[derive(Debug)]
+struct ClientSenderState {
+    sink: RwLock<
+        futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
+    >,
+    budget: Mutex<OutboundBudget>,
+}
+
+type ClientSender = Arc<ClientSenderState>;
 
 fn websocket_config() -> WebSocketConfig {
     WebSocketConfig {
@@ -731,12 +937,153 @@ fn max_connections() -> usize {
     connection_limit_from_env(std::env::var("MAX_CONNECTIONS").ok().as_deref())
 }
 
+fn max_connections_per_ip() -> usize {
+    std::env::var("MAX_CONNECTIONS_PER_IP")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IPV4)
+}
+
+async fn try_acquire_ip_connection(
+    counts: &IpConnectionCounts,
+    ip: std::net::IpAddr,
+    limit: usize,
+) -> bool {
+    let mut counts = counts.lock().await;
+    let count = counts.entry(ip).or_default();
+    if *count >= limit {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+async fn release_ip_connection(counts: &IpConnectionCounts, ip: std::net::IpAddr) {
+    let mut counts = counts.lock().await;
+    if let Some(count) = counts.get_mut(&ip) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&ip);
+        }
+    }
+}
+
+async fn allow_ip_message(limiters: &IpMessageLimiters, ip: std::net::IpAddr) -> bool {
+    let mut limiters = limiters.lock().await;
+    limiters.retain(|_, limiter| {
+        limiter.window_started.elapsed()
+            < tokio::time::Duration::from_secs(MESSAGE_RATE_WINDOW_SECS * 2)
+    });
+    if !limiters.contains_key(&ip) && limiters.len() >= MAX_TRACKED_IP_MESSAGE_LIMITERS {
+        return false;
+    }
+    limiters
+        .entry(ip)
+        .or_insert_with(MessageRateLimiter::new)
+        .allow()
+}
+
 const CHAT_TOKEN_BYTES: usize = 32;
 
 fn generate_chat_token() -> String {
     let mut bytes = [0u8; CHAT_TOKEN_BYTES];
     OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn random_hex<const N: usize>() -> String {
+    let mut bytes = [0u8; N];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn random_session_generation() -> u64 {
+    // Keep the value in JavaScript's safe-integer range while retaining at
+    // least 16 decimal digits for desktop clients' generation validator.
+    loop {
+        let value = OsRng.next_u64() & ((1u64 << 53) - 1);
+        if (1_000_000_000_000_000..=9_000_000_000_000_000).contains(&value) {
+            return value;
+        }
+    }
+}
+
+fn registration_canonical(challenge: &str, lobby_name: &str, virtual_ip: &str) -> Vec<u8> {
+    format!(
+        "MCTIER-SIGNALING-V3\n{}\n{}\n{}\n{}",
+        SIGNALING_PROTOCOL_VERSION, challenge, lobby_name, virtual_ip
+    )
+    .into_bytes()
+}
+
+/// Validate the v3 proof and derive the only client id accepted by the server.
+fn verify_registration_identity(
+    challenge: &str,
+    lobby_name: &str,
+    virtual_ip: &str,
+    identity_public_key: &str,
+    challenge_signature: &str,
+) -> Option<(String, String, String)> {
+    let encoded = identity_public_key.trim();
+    if encoded.is_empty() || encoded.len() > MAX_IDENTITY_PUBLIC_KEY_LEN {
+        return None;
+    }
+    let public_key_der = BASE64_STANDARD.decode(encoded).ok()?;
+    if public_key_der.is_empty() || public_key_der.len() > 200 {
+        return None;
+    }
+    let verifying_key = VerifyingKey::from_public_key_der(&public_key_der).ok()?;
+
+    let encoded_signature = challenge_signature.trim();
+    if encoded_signature.is_empty() || encoded_signature.len() > MAX_IDENTITY_SIGNATURE_LEN {
+        return None;
+    }
+    let signature_der = BASE64_STANDARD.decode(encoded_signature).ok()?;
+    let signature = Signature::from_der(&signature_der).ok()?;
+    verifying_key
+        .verify(
+            &registration_canonical(challenge, lobby_name, virtual_ip),
+            &signature,
+        )
+        .ok()?;
+
+    let digest = Sha256::digest(&public_key_der);
+    let client_id = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let virtual_domain = format!("{}.mct.net", &client_id[..32]);
+    Some((client_id, encoded.to_string(), virtual_domain))
+}
+
+#[derive(Debug)]
+struct MessageRateLimiter {
+    window_started: tokio::time::Instant,
+    messages: u32,
+}
+
+impl MessageRateLimiter {
+    fn new() -> Self {
+        Self {
+            window_started: tokio::time::Instant::now(),
+            messages: 0,
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.window_started.elapsed()
+            >= tokio::time::Duration::from_secs(MESSAGE_RATE_WINDOW_SECS)
+        {
+            self.window_started = tokio::time::Instant::now();
+            self.messages = 0;
+        }
+        if self.messages >= MAX_MESSAGES_PER_WINDOW {
+            return false;
+        }
+        self.messages += 1;
+        true
+    }
 }
 
 fn rotate_chat_token(lobby: &mut LobbyInfo) -> (String, u64) {
@@ -760,22 +1107,365 @@ fn valid_text(value: &str, max_len: usize, allow_empty: bool) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-/// 聊天签名公钥只做形状校验：base64 字符集 + 长度上限。
-///
-/// 服务器刻意不解析曲线点——它不需要，也不应该成为密码学解析器的攻击面。
-/// 真正的解析与验签由收到名册的客户端完成，非法公钥在那里被拒绝。
+fn valid_identifier(value: &str) -> bool {
+    valid_text(value, MAX_CLIENT_ID_LEN, false)
+}
+
+fn valid_control_text(value: &str, max_len: usize, allow_empty: bool) -> bool {
+    valid_text(value, max_len.min(MAX_CONTROL_TEXT_LEN), allow_empty)
+}
+
+fn valid_session_id(value: &str) -> bool {
+    valid_text(value, MAX_REMOTE_SESSION_ID_LEN, false)
+}
+
+fn valid_share_id(value: &str) -> bool {
+    valid_text(value, MAX_SHARE_ID_LEN, false)
+}
+
+fn valid_session_description(sdp_type: &str, sdp: &str, expected_type: &str) -> bool {
+    sdp_type == expected_type
+        && sdp.len() <= MAX_SDP_LEN
+        && !sdp.is_empty()
+        // SDP is conventionally CRLF-delimited; reject other controls while
+        // preserving the wire format emitted by WebRTC implementations.
+        && !sdp
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\r' && ch != '\n')
+}
+
+fn valid_offer_data(data: &OfferData, expected_type: &str) -> bool {
+    valid_session_description(&data.sdp_type, &data.sdp, expected_type)
+}
+
+fn valid_answer_data(data: &AnswerData, expected_type: &str) -> bool {
+    valid_session_description(&data.sdp_type, &data.sdp, expected_type)
+}
+
+fn valid_candidate_data(data: &CandidateData) -> bool {
+    !data.candidate.is_empty()
+        && data.candidate.len() <= MAX_ICE_CANDIDATE_LEN
+        && !data.candidate.chars().any(char::is_control)
+        && data.sdp_m_line_index.is_none_or(|index| index <= 256)
+        && data
+            .sdp_mid
+            .as_deref()
+            .is_none_or(|mid| valid_control_text(mid, 128, true))
+}
+
+/// Apply payload limits before any routing or logging. WebSocket frame limits
+/// protect the parser; these bounds protect downstream consumers and logs.
+fn validate_message_shape(message: &SignalingMessage) -> bool {
+    let ids = |from: &str, to: &str| valid_identifier(from) && valid_identifier(to);
+    let optional_control = |value: Option<&String>, max_len: usize| {
+        value.is_none() || value.is_some_and(|value| valid_control_text(value, max_len, true))
+    };
+    match message {
+        SignalingMessage::ServerChallenge { challenge, .. } => {
+            challenge.len() == CHALLENGE_BYTES * 2
+                && challenge
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        SignalingMessage::RegisterV3 {
+            identity_public_key,
+            challenge_signature,
+            player_name,
+            virtual_ip,
+            virtual_domain,
+            lobby_name,
+            lobby_password,
+            client_version,
+            ..
+        } => {
+            identity_public_key.len() <= MAX_IDENTITY_PUBLIC_KEY_LEN
+                && challenge_signature.len() <= MAX_IDENTITY_SIGNATURE_LEN
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+                && virtual_ip
+                    .as_deref()
+                    .is_some_and(|ip| valid_control_text(ip, 32, false))
+                && optional_control(virtual_domain.as_ref(), MAX_VIRTUAL_DOMAIN_LEN)
+                && valid_control_text(lobby_name, MAX_LOBBY_NAME_LEN, false)
+                && valid_control_text(lobby_password, MAX_LOBBY_PASSWORD_LEN, true)
+                && optional_control(client_version.as_ref(), MAX_CLIENT_VERSION_LEN)
+        }
+        SignalingMessage::Register {
+            client_id,
+            player_name,
+            virtual_ip,
+            virtual_domain,
+            lobby_name,
+            lobby_password,
+            client_version,
+            chat_public_key,
+            ..
+        } => {
+            valid_identifier(client_id)
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+                && virtual_ip
+                    .as_deref()
+                    .is_none_or(|ip| valid_control_text(ip, 32, false))
+                && optional_control(virtual_domain.as_ref(), MAX_VIRTUAL_DOMAIN_LEN)
+                && valid_control_text(lobby_name, MAX_LOBBY_NAME_LEN, false)
+                && valid_control_text(lobby_password, MAX_LOBBY_PASSWORD_LEN, true)
+                && optional_control(client_version.as_ref(), MAX_CLIENT_VERSION_LEN)
+                && optional_control(chat_public_key.as_ref(), MAX_CHAT_PUBLIC_KEY_LEN)
+        }
+        SignalingMessage::Offer {
+            from, to, offer, ..
+        } => ids(from, to) && valid_offer_data(offer, "offer"),
+        SignalingMessage::Answer { from, to, answer } => {
+            ids(from, to) && valid_answer_data(answer, "answer")
+        }
+        SignalingMessage::IceCandidate {
+            from,
+            to,
+            candidate,
+        } => ids(from, to) && valid_candidate_data(candidate),
+        SignalingMessage::ChatMessage {
+            from,
+            player_id,
+            player_name,
+            content,
+            ..
+        } => {
+            valid_identifier(from)
+                && valid_identifier(player_id)
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+                && valid_control_text(content, MAX_CONTROL_TEXT_LEN, false)
+        }
+        SignalingMessage::StatusUpdate { client_id, .. } => valid_identifier(client_id),
+        SignalingMessage::ScreenShareStart {
+            from,
+            share_id,
+            player_name,
+            ..
+        } => {
+            valid_identifier(from)
+                && valid_share_id(share_id)
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+        }
+        SignalingMessage::ScreenShareStop { from, share_id }
+        | SignalingMessage::ScreenShareViewerLeft { from, share_id } => {
+            valid_identifier(from) && valid_share_id(share_id)
+        }
+        SignalingMessage::ScreenShareRelay {
+            from,
+            to,
+            share_id,
+            action,
+            player_name,
+            password,
+            upstream_id,
+            downstream_id,
+            ..
+        } => {
+            ids(from, to)
+                && valid_share_id(share_id)
+                && valid_control_text(action, 32, false)
+                && optional_control(player_name.as_ref(), MAX_PLAYER_NAME_LEN)
+                && optional_control(password.as_ref(), MAX_CONTROL_TEXT_LEN)
+                && optional_control(upstream_id.as_ref(), MAX_CLIENT_ID_LEN)
+                && optional_control(downstream_id.as_ref(), MAX_CLIENT_ID_LEN)
+        }
+        SignalingMessage::ScreenShareOffer {
+            from,
+            to,
+            share_id,
+            player_name,
+            password,
+            offer,
+            ..
+        } => {
+            ids(from, to)
+                && valid_share_id(share_id)
+                && optional_control(player_name.as_ref(), MAX_PLAYER_NAME_LEN)
+                && optional_control(password.as_ref(), MAX_CONTROL_TEXT_LEN)
+                && valid_offer_data(offer, "offer")
+        }
+        SignalingMessage::ScreenShareAnswer {
+            from,
+            to,
+            share_id,
+            answer,
+            ..
+        } => ids(from, to) && valid_share_id(share_id) && valid_answer_data(answer, "answer"),
+        SignalingMessage::ScreenShareIceCandidate {
+            from,
+            to,
+            share_id,
+            candidate,
+            connection_role,
+            ..
+        } => {
+            ids(from, to)
+                && valid_share_id(share_id)
+                && optional_control(connection_role.as_ref(), 32)
+                && valid_candidate_data(candidate)
+        }
+        SignalingMessage::ScreenShareError {
+            from,
+            to,
+            share_id,
+            error,
+        } => {
+            ids(from, to)
+                && valid_share_id(share_id)
+                && valid_control_text(error, MAX_ERROR_TEXT_LEN, false)
+        }
+        SignalingMessage::ScreenShareListRequest { from }
+        | SignalingMessage::FileShareListRequest { from } => valid_identifier(from),
+        SignalingMessage::ScreenShareListResponse {
+            from,
+            to,
+            share_id,
+            player_name,
+            ..
+        } => {
+            ids(from, to)
+                && valid_share_id(share_id)
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+        }
+        SignalingMessage::ScreenShareUpdate {
+            from,
+            share_id,
+            viewer_id,
+            viewer_name,
+            ..
+        } => {
+            valid_identifier(from)
+                && valid_share_id(share_id)
+                && optional_control(viewer_id.as_ref(), MAX_CLIENT_ID_LEN)
+                && optional_control(viewer_name.as_ref(), MAX_PLAYER_NAME_LEN)
+        }
+        SignalingMessage::FileShareAdded {
+            from,
+            share_id,
+            share_name,
+            player_name,
+            ..
+        } => {
+            valid_identifier(from)
+                && valid_share_id(share_id)
+                && valid_control_text(share_name, MAX_SHARE_NAME_LEN, false)
+                && valid_control_text(player_name, MAX_PLAYER_NAME_LEN, false)
+        }
+        SignalingMessage::FileShareRemoved { from, share_id } => {
+            valid_identifier(from) && valid_share_id(share_id)
+        }
+        SignalingMessage::FileShareListResponse {
+            from, to, shares, ..
+        } => {
+            ids(from, to)
+                && shares.len() <= 256
+                && shares.iter().all(|share| {
+                    valid_share_id(&share.share_id)
+                        && valid_control_text(&share.share_name, MAX_SHARE_NAME_LEN, false)
+                        && valid_control_text(&share.player_name, MAX_PLAYER_NAME_LEN, false)
+                })
+        }
+        SignalingMessage::ShareUpdated {
+            from,
+            share_id,
+            share_name,
+            player_name,
+            ..
+        } => {
+            valid_identifier(from)
+                && valid_share_id(share_id)
+                && optional_control(share_name.as_ref(), MAX_SHARE_NAME_LEN)
+                && optional_control(player_name.as_ref(), MAX_PLAYER_NAME_LEN)
+        }
+        SignalingMessage::RemoteControlRequest {
+            from,
+            to,
+            session_id,
+            from_name,
+        } => {
+            ids(from, to)
+                && valid_session_id(session_id)
+                && valid_control_text(from_name, 64, false)
+        }
+        SignalingMessage::RemoteControlAccept {
+            from,
+            to,
+            session_id,
+        }
+        | SignalingMessage::RemoteControlStop {
+            from,
+            to,
+            session_id,
+        } => ids(from, to) && valid_session_id(session_id),
+        SignalingMessage::RemoteControlReject {
+            from,
+            to,
+            session_id,
+            reason,
+        } => {
+            ids(from, to)
+                && valid_session_id(session_id)
+                && valid_control_text(reason, MAX_ERROR_TEXT_LEN, false)
+        }
+        SignalingMessage::RemoteControlOffer {
+            from,
+            to,
+            session_id,
+            offer,
+        } => ids(from, to) && valid_session_id(session_id) && valid_offer_data(offer, "offer"),
+        SignalingMessage::RemoteControlAnswer {
+            from,
+            to,
+            session_id,
+            answer,
+        } => ids(from, to) && valid_session_id(session_id) && valid_answer_data(answer, "answer"),
+        SignalingMessage::RemoteControlIce {
+            from,
+            to,
+            session_id,
+            candidate,
+        } => ids(from, to) && valid_session_id(session_id) && valid_candidate_data(candidate),
+        SignalingMessage::Leave { client_id } => valid_identifier(client_id),
+        SignalingMessage::KickPlayer { from, target }
+        | SignalingMessage::MutePlayer { from, target, .. }
+        | SignalingMessage::TransferHost { from, target } => {
+            valid_identifier(from) && valid_identifier(target)
+        }
+        SignalingMessage::SetLobbyOptions {
+            from,
+            description,
+            server_node,
+            ..
+        } => {
+            valid_identifier(from)
+                && optional_control(description.as_ref(), MAX_CONTROL_TEXT_LEN)
+                && optional_control(server_node.as_ref(), MAX_LOBBY_PASSWORD_LEN)
+        }
+        SignalingMessage::CommunityNodeSubmit {
+            name,
+            address,
+            submitter,
+        } => {
+            valid_control_text(name, COMMUNITY_NODE_NAME_MAX_LEN, false)
+                && valid_control_text(address, COMMUNITY_NODE_ADDRESS_MAX_LEN, false)
+                && optional_control(submitter.as_ref(), COMMUNITY_NODE_SUBMITTER_MAX_LEN)
+        }
+        _ => true,
+    }
+}
+
+/// Identity keys are parsed and verified during v3 registration. This helper is
+/// retained for tests and roster assertions only.
 fn valid_chat_public_key(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_CHAT_PUBLIC_KEY_LEN
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    if value.is_empty() || value.len() > MAX_CHAT_PUBLIC_KEY_LEN {
+        return false;
+    }
+    BASE64_STANDARD
+        .decode(value)
+        .ok()
+        .is_some_and(|der| VerifyingKey::from_public_key_der(&der).is_ok())
 }
 
 /// 归一化注册时提交的公钥：非法值一律丢弃成 None，而不是原样入册。
-///
-/// 丢弃而非报错是为了兼容旧客户端——它们不发这个字段，仍可加入大厅，
-/// 只是拿不到签名能力（对端会因缺签名而拒收其消息）。
 fn normalize_chat_public_key(raw: Option<String>) -> Option<String> {
     let trimmed = raw?.trim().to_string();
     if valid_chat_public_key(&trimmed) {
@@ -809,9 +1499,28 @@ where
 }
 
 async fn send_message(sender: &ClientSender, message: Message) -> bool {
+    let message_bytes = match &message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) => bytes.len(),
+        Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+        Message::Close(_) => 0,
+        Message::Frame(_) => 0,
+    };
+    {
+        let mut budget = sender.budget.lock().await;
+        if !budget.allow(message_bytes) {
+            log::warn!(
+                "丢弃超出出站预算的消息: bytes={}, frames_limit={}, bytes_limit={}",
+                message_bytes,
+                MAX_OUTBOUND_FRAMES_PER_WINDOW,
+                MAX_OUTBOUND_BYTES_PER_WINDOW
+            );
+            return false;
+        }
+    }
     send_with_timeout(async {
-        let mut sender = sender.write().await;
-        sender.send(message).await
+        let mut sink = sender.sink.write().await;
+        sink.send(message).await
     })
     .await
 }
@@ -820,23 +1529,92 @@ async fn send_text(sender: &ClientSender, text: String) -> bool {
     send_message(sender, Message::Text(text)).await
 }
 
+fn json_sender_id(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    value
+        .get("from")
+        .or_else(|| value.get("clientId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn inject_session_metadata(raw: String, sender_id: &str, generation: u64) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return raw;
+    };
+    if object.contains_key("from") {
+        object.insert(
+            "from".to_string(),
+            serde_json::Value::String(sender_id.to_string()),
+        );
+    }
+    if object.contains_key("clientId") {
+        object.insert(
+            "clientId".to_string(),
+            serde_json::Value::String(sender_id.to_string()),
+        );
+    }
+    object.insert(
+        "sessionGeneration".to_string(),
+        serde_json::Value::from(generation),
+    );
+    serde_json::to_string(&value).unwrap_or(raw)
+}
+
 async fn send_to_lobby_client(
     lobbies: &Lobbies,
     lobby_id: &str,
     client_id: &str,
     message: Message,
 ) -> bool {
-    let sender = {
+    let raw_text = match &message {
+        Message::Text(text) => Some(text.clone()),
+        _ => None,
+    };
+    let source_id = raw_text.as_deref().and_then(json_sender_id);
+    let sender_info = {
         let lobbies_read = lobbies.read().await;
-        lobbies_read
-            .get(lobby_id)
-            .and_then(|lobby| lobby.clients.get(client_id))
-            .map(|client| Arc::clone(&client.sender))
+        lobbies_read.get(lobby_id).and_then(|lobby| {
+            let target = lobby.clients.get(client_id)?;
+            let generation = source_id
+                .as_deref()
+                .and_then(|source_id| lobby.clients.get(source_id))
+                .map(|source| source.session_generation);
+            Some((
+                Arc::clone(&target.sender),
+                target.disconnect.clone(),
+                generation,
+            ))
+        })
     };
 
-    match sender {
-        Some(sender) => send_message(&sender, message).await,
-        None => false,
+    match (sender_info, raw_text) {
+        (Some((sender, disconnect, Some(generation))), Some(text)) => {
+            let ok = send_message(
+                &sender,
+                Message::Text(inject_session_metadata(
+                    text,
+                    source_id.as_deref().unwrap_or_default(),
+                    generation,
+                )),
+            )
+            .await;
+            if !ok {
+                let _ = disconnect.send(true);
+            }
+            ok
+        }
+        (Some((sender, disconnect, _)), _) => {
+            let ok = send_message(&sender, message).await;
+            if !ok {
+                let _ = disconnect.send(true);
+            }
+            ok
+        }
+        (None, _) => false,
     }
 }
 
@@ -844,13 +1622,16 @@ async fn is_current_session(
     lobbies: &Lobbies,
     lobby_id: &str,
     client_id: &str,
+    session_generation: u64,
     sender: &ClientSender,
 ) -> bool {
     let lobbies_read = lobbies.read().await;
     lobbies_read
         .get(lobby_id)
         .and_then(|lobby| lobby.clients.get(client_id))
-        .map(|client| Arc::ptr_eq(&client.sender, sender))
+        .map(|client| {
+            client.session_generation == session_generation && Arc::ptr_eq(&client.sender, sender)
+        })
         .unwrap_or(false)
 }
 
@@ -993,6 +1774,7 @@ enum ProbeOutcome {
     Alive(u64),
     Dead,
     Blocked,
+    Busy,
 }
 
 /// 判断 IP 是否允许作为探测目标。
@@ -1114,8 +1896,8 @@ async fn probe_community_node_tcp(targets: &[SocketAddr]) -> Option<u64> {
 ///
 /// UDP 无握手，只能借助 ICMP：已 connect 的 UDP socket 在收到
 /// “port unreachable” 后，下一次 recv 会返回 ConnectionReset/ConnectionRefused，
-/// 据此判定失效。完全没有回包时保守判定存活，避免把只监听 UDP、
-/// 且上游丢弃 ICMP 的正常节点误删。
+/// 据此判定失效。完全没有回包时按失败处理，避免把任意静默 UDP 端口
+/// 当成“共享节点在线”并长期保留。
 async fn probe_community_node_udp(target: SocketAddr) -> Option<u64> {
     let start = std::time::Instant::now();
     let bind_addr = if target.is_ipv6() {
@@ -1138,9 +1920,24 @@ async fn probe_community_node_udp(target: SocketAddr) -> Option<u64> {
         Ok(Ok(_)) => Some(start.elapsed().as_millis() as u64),
         // ICMP 端口不可达：确定失效
         Ok(Err(_)) => None,
-        // 既无回包也无 ICMP：保守判活
-        Err(_) => Some(start.elapsed().as_millis() as u64),
+        // 既无回包也无 ICMP：不能证明节点存活，按失败处理
+        Err(_) => None,
     }
+}
+
+async fn probe_community_node_limited(address: &str, probe_limiter: &ProbeLimiter) -> ProbeOutcome {
+    let permit = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(COMMUNITY_NODE_PROBE_QUEUE_TIMEOUT_SECS),
+        probe_limiter.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return ProbeOutcome::Busy,
+    };
+    let outcome = probe_community_node(address).await;
+    drop(permit);
+    outcome
 }
 
 /// 探测节点可达性。
@@ -1212,8 +2009,17 @@ fn load_community_nodes_from_disk(path: &str, now: u64) -> HashMap<String, Commu
     map
 }
 
-/// 将投稿节点写回磁盘（先写临时文件再 rename，避免进程被杀时留下半截 JSON）
+fn community_persist_lock() -> &'static Arc<Mutex<()>> {
+    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(Mutex::new(())))
+}
+
+static COMMUNITY_PERSIST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 将投稿节点写回磁盘。所有写入经过同一串行锁，并使用带 generation 的
+/// 唯一临时文件，避免并发投稿时旧快照覆盖新快照或争用固定 `.tmp`。
 async fn persist_community_nodes(nodes: &CommunityNodes) {
+    let _guard = community_persist_lock().lock().await;
     let snapshot: Vec<CommunityNodeInfo> = {
         let read = nodes.read().await;
         let mut list: Vec<CommunityNodeInfo> = read.values().cloned().collect();
@@ -1228,10 +2034,15 @@ async fn persist_community_nodes(nodes: &CommunityNodes) {
             return;
         }
     };
+    let generation = COMMUNITY_PERSIST_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let result = tokio::task::spawn_blocking(move || {
-        let tmp = format!("{}.tmp", path);
+        let tmp = format!("{}.{}.{}.tmp", path, std::process::id(), generation);
         std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let rename_result = std::fs::rename(&tmp, &path);
+        if rename_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        rename_result
     })
     .await;
     match result {
@@ -1262,7 +2073,19 @@ async fn community_node_list(nodes: &CommunityNodes) -> Vec<CommunityNodeInfo> {
 /// 对全部投稿节点做一轮探测，并移除失效超过 1 天的条目。
 ///
 /// 返回 (在线数, 移除数)。探测在锁外并发执行，只有回写结果时才短暂持写锁。
+#[allow(dead_code)]
 async fn sweep_community_nodes(nodes: &CommunityNodes) -> (usize, usize) {
+    sweep_community_nodes_with_limiter(
+        nodes,
+        &Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY)),
+    )
+    .await
+}
+
+async fn sweep_community_nodes_with_limiter(
+    nodes: &CommunityNodes,
+    probe_limiter: &ProbeLimiter,
+) -> (usize, usize) {
     let targets: Vec<String> = {
         let read = nodes.read().await;
         read.keys().cloned().collect()
@@ -1276,7 +2099,7 @@ async fn sweep_community_nodes(nodes: &CommunityNodes) -> (usize, usize) {
         let probes = chunk.iter().map(|address| {
             let address = address.clone();
             async move {
-                let outcome = probe_community_node(&address).await;
+                let outcome = probe_community_node_limited(&address, probe_limiter).await;
                 (address, outcome)
             }
         });
@@ -1306,6 +2129,8 @@ async fn sweep_community_nodes(nodes: &CommunityNodes) -> (usize, usize) {
                     node.online = false;
                     node.latency_ms = None;
                 }
+                // 竞争到达共享探测预算时保留上一次状态，不把排队失败误记为掉线。
+                ProbeOutcome::Busy => {}
             }
         }
         let before = write.len();
@@ -1330,7 +2155,7 @@ async fn sweep_community_nodes(nodes: &CommunityNodes) -> (usize, usize) {
 }
 
 /// 后台巡检任务：周期性探测投稿节点并淘汰失效条目
-async fn spawn_community_node_sweeper(nodes: CommunityNodes) {
+async fn spawn_community_node_sweeper(nodes: CommunityNodes, probe_limiter: ProbeLimiter) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             COMMUNITY_NODE_PROBE_INTERVAL_SECS,
@@ -1342,7 +2167,8 @@ async fn spawn_community_node_sweeper(nodes: CommunityNodes) {
             if total == 0 {
                 continue;
             }
-            let (online, removed) = sweep_community_nodes(&nodes).await;
+            let (online, removed) =
+                sweep_community_nodes_with_limiter(&nodes, &probe_limiter).await;
             log::info!(
                 "投稿节点巡检完成：共 {} 个，在线 {} 个，本轮移除 {} 个",
                 total,
@@ -1356,9 +2182,34 @@ async fn spawn_community_node_sweeper(nodes: CommunityNodes) {
 /// 处理一次投稿请求，返回给客户端的结果消息。
 ///
 /// 先校验、后探测、再入库：探测不通的节点直接拒绝，避免把死地址写进公共列表。
+#[allow(dead_code)]
 async fn handle_community_node_submit(
     nodes: &CommunityNodes,
     cooldowns: &SubmitCooldowns,
+    peer: SocketAddr,
+    name: String,
+    address: String,
+    submitter: Option<String>,
+) -> SignalingMessage {
+    handle_community_node_submit_with_limits(
+        nodes,
+        cooldowns,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY)),
+        peer,
+        name,
+        address,
+        submitter,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_community_node_submit_with_limits(
+    nodes: &CommunityNodes,
+    cooldowns: &SubmitCooldowns,
+    quotas: &SubmitQuotas,
+    probe_limiter: &ProbeLimiter,
     peer: SocketAddr,
     name: String,
     address: String,
@@ -1384,6 +2235,24 @@ async fn handle_community_node_submit(
 
     let now = now_unix_secs();
 
+    {
+        let mut quotas = quotas.lock().await;
+        quotas.retain(|_, quota| {
+            quota.window_started.elapsed()
+                < tokio::time::Duration::from_secs(COMMUNITY_NODE_SUBMIT_WINDOW_SECS * 2)
+        });
+        if !quotas.contains_key(&peer.ip()) && quotas.len() >= MAX_TRACKED_IP_SUBMITTERS {
+            return reject("投稿来源过多，请稍后再试");
+        }
+        let quota = quotas.entry(peer.ip()).or_insert_with(|| SubmitQuota {
+            window_started: tokio::time::Instant::now(),
+            submissions: 0,
+        });
+        if !allow_submit_quota(quota) {
+            return reject("该来源的投稿配额已用尽，请稍后再试");
+        }
+    }
+
     // 限流：同一来源 IP 冷却期内只允许投稿一次
     {
         let mut write = cooldowns.write().await;
@@ -1402,12 +2271,13 @@ async fn handle_community_node_submit(
     }
 
     // 投稿即探测：不可达或不允许探测的地址都不入库
-    let latency = match probe_community_node(&normalized).await {
+    let latency = match probe_community_node_limited(&normalized, probe_limiter).await {
         ProbeOutcome::Alive(ms) => ms,
         ProbeOutcome::Dead => return reject("该节点当前不可达，请确认地址与端口后重新提交"),
         ProbeOutcome::Blocked => {
             return reject("只接受公网可访问的节点地址，回环/内网/保留地址无法作为共享节点")
         }
+        ProbeOutcome::Busy => return reject("当前探测队列繁忙，请稍后再试"),
     };
 
     let node = {
@@ -1478,6 +2348,10 @@ async fn main() {
     let max_connections = max_connections();
     log::info!("最大并发连接数: {}", max_connections);
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
+    let max_connections_per_ip = max_connections_per_ip();
+    log::info!("每来源地址最大并发连接数: {}", max_connections_per_ip);
+    let ip_connection_counts: IpConnectionCounts = Arc::new(Mutex::new(HashMap::new()));
+    let ip_message_limiters: IpMessageLimiters = Arc::new(Mutex::new(HashMap::new()));
 
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -1489,6 +2363,8 @@ async fn main() {
         now_unix_secs(),
     )));
     let submit_cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+    let submit_quotas: SubmitQuotas = Arc::new(Mutex::new(HashMap::new()));
+    let probe_limiter: ProbeLimiter = Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY));
     log::info!(
         "共享节点：容量上限 {}，巡检周期 {} 秒，失效超过 {} 秒自动移除，存档 {}",
         community_node_capacity(),
@@ -1496,7 +2372,7 @@ async fn main() {
         COMMUNITY_NODE_MAX_OFFLINE_SECS,
         community_nodes_file()
     );
-    spawn_community_node_sweeper(Arc::clone(&community_nodes)).await;
+    spawn_community_node_sweeper(Arc::clone(&community_nodes), Arc::clone(&probe_limiter)).await;
 
     // 绑定监听地址
     let listener = match TcpListener::bind(&listen_addr).await {
@@ -1528,11 +2404,31 @@ async fn main() {
                         continue;
                     }
                 };
+                let ip_connection_acquired = try_acquire_ip_connection(
+                    &ip_connection_counts,
+                    addr.ip(),
+                    max_connections_per_ip,
+                )
+                .await;
+                if !ip_connection_acquired {
+                    log::warn!(
+                        "来源地址连接数已达上限（{}），拒绝客户端: {}",
+                        max_connections_per_ip,
+                        addr
+                    );
+                    drop(connection_permit);
+                    continue;
+                }
 
                 let lobbies_clone = Arc::clone(&lobbies);
                 let client_lobby_map_clone = Arc::clone(&client_lobby_map);
                 let community_nodes_clone = Arc::clone(&community_nodes);
                 let submit_cooldowns_clone = Arc::clone(&submit_cooldowns);
+                let submit_quotas_clone = Arc::clone(&submit_quotas);
+                let probe_limiter_clone = Arc::clone(&probe_limiter);
+                let ip_message_limiters_clone = Arc::clone(&ip_message_limiters);
+                let ip_connection_counts_clone = Arc::clone(&ip_connection_counts);
+                let peer_ip = addr.ip();
 
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
@@ -1543,11 +2439,15 @@ async fn main() {
                         client_lobby_map_clone,
                         community_nodes_clone,
                         submit_cooldowns_clone,
+                        submit_quotas_clone,
+                        probe_limiter_clone,
+                        ip_message_limiters_clone,
                     )
                     .await
                     {
                         log::error!("处理客户端连接失败 ({}): {}", addr, e);
                     }
+                    release_ip_connection(&ip_connection_counts_clone, peer_ip).await;
                 });
             }
             Err(e) => {
@@ -1559,6 +2459,7 @@ async fn main() {
 }
 
 /// 处理客户端连接
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
@@ -1566,14 +2467,20 @@ async fn handle_connection(
     client_lobby_map: ClientLobbyMap,
     community_nodes: CommunityNodes,
     submit_cooldowns: SubmitCooldowns,
+    submit_quotas: SubmitQuotas,
+    probe_limiter: ProbeLimiter,
+    ip_message_limiters: IpMessageLimiters,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    handle_connection_with_timeouts(
+    handle_connection_with_timeouts_and_limits(
         stream,
         addr,
         lobbies,
         client_lobby_map,
         community_nodes,
         submit_cooldowns,
+        submit_quotas,
+        probe_limiter,
+        ip_message_limiters,
         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTERED_IDLE_TIMEOUT_SECS),
@@ -1582,6 +2489,7 @@ async fn handle_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn handle_connection_with_timeouts(
     stream: TcpStream,
     addr: SocketAddr,
@@ -1589,6 +2497,38 @@ async fn handle_connection_with_timeouts(
     client_lobby_map: ClientLobbyMap,
     community_nodes: CommunityNodes,
     submit_cooldowns: SubmitCooldowns,
+    handshake_timeout: tokio::time::Duration,
+    registration_timeout: tokio::time::Duration,
+    idle_timeout: tokio::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    handle_connection_with_timeouts_and_limits(
+        stream,
+        addr,
+        lobbies,
+        client_lobby_map,
+        community_nodes,
+        submit_cooldowns,
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY)),
+        Arc::new(Mutex::new(HashMap::new())),
+        handshake_timeout,
+        registration_timeout,
+        idle_timeout,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection_with_timeouts_and_limits(
+    stream: TcpStream,
+    addr: SocketAddr,
+    lobbies: Lobbies,
+    client_lobby_map: ClientLobbyMap,
+    community_nodes: CommunityNodes,
+    submit_cooldowns: SubmitCooldowns,
+    submit_quotas: SubmitQuotas,
+    probe_limiter: ProbeLimiter,
+    ip_message_limiters: IpMessageLimiters,
     handshake_timeout: tokio::time::Duration,
     registration_timeout: tokio::time::Duration,
     idle_timeout: tokio::time::Duration,
@@ -1614,11 +2554,26 @@ async fn handle_connection_with_timeouts(
     log::info!("✅ WebSocket 连接已建立: {}", addr);
 
     let (write, mut read) = ws_stream.split();
-    let write = Arc::new(RwLock::new(write));
+    let write = Arc::new(ClientSenderState {
+        sink: RwLock::new(write),
+        budget: Mutex::new(OutboundBudget::new()),
+    });
     let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
 
     let mut client_id: Option<String> = None;
     let mut lobby_id: Option<String> = None;
+    let mut session_generation = 0u64;
+    let challenge = random_hex::<CHALLENGE_BYTES>();
+    let challenge_message = SignalingMessage::ServerChallenge {
+        challenge: challenge.clone(),
+        protocol_version: SIGNALING_PROTOCOL_VERSION,
+    };
+    if let Ok(json) = serde_json::to_string(&challenge_message) {
+        if !send_text(&write, json).await {
+            return Ok(());
+        }
+    }
+    let mut connection_rate_limiter = MessageRateLimiter::new();
 
     // 标记是否已注册
     let mut is_registered = false;
@@ -1665,10 +2620,24 @@ async fn handle_connection_with_timeouts(
 
         match msg_result {
             Ok(msg) => {
+                if !connection_rate_limiter.allow()
+                    || !allow_ip_message(&ip_message_limiters, addr.ip()).await
+                {
+                    log::warn!("连接或来源地址消息速率超限，关闭连接: {}", addr);
+                    let _ = send_message(&write, Message::Close(None)).await;
+                    break;
+                }
                 if is_registered {
                     let current = match (client_id.as_deref(), lobby_id.as_deref()) {
                         (Some(client_id), Some(lobby_id)) => {
-                            is_current_session(&lobbies, lobby_id, client_id, &write).await
+                            is_current_session(
+                                &lobbies,
+                                lobby_id,
+                                client_id,
+                                session_generation,
+                                &write,
+                            )
+                            .await
                         }
                         _ => false,
                     };
@@ -1684,6 +2653,16 @@ async fn handle_connection_with_timeouts(
 
                     match serde_json::from_str::<SignalingMessage>(text) {
                         Ok(message) => {
+                            if !validate_message_shape(&message) {
+                                log::warn!("拒绝超出字段边界的信令消息: peer={}", addr);
+                                let error_msg = SignalingMessage::RegisterError {
+                                    message: "信令字段无效或超出长度限制".to_string(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&error_msg) {
+                                    send_text(&write, json).await;
+                                }
+                                break;
+                            }
                             if let Some(claimed_sender) = message.claimed_sender(text) {
                                 if client_id.as_deref() != Some(claimed_sender.as_str()) {
                                     log::warn!(
@@ -1697,16 +2676,27 @@ async fn handle_connection_with_timeouts(
                             }
 
                             match message {
-                                SignalingMessage::Register {
-                                    client_id: cid,
+                                SignalingMessage::Register { .. } => {
+                                    let error_msg = SignalingMessage::RegisterError {
+                                        message: "已拒绝旧注册协议，请先等待 server-challenge 后使用 register-v3"
+                                            .to_string(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&error_msg) {
+                                        send_text(&write, json).await;
+                                    }
+                                    break;
+                                }
+                                SignalingMessage::RegisterV3 {
+                                    protocol_version,
+                                    identity_public_key,
+                                    challenge_signature,
                                     player_name,
                                     virtual_ip,
-                                    virtual_domain,
-                                    use_domain,
+                                    virtual_domain: _client_virtual_domain,
+                                    use_domain: _client_use_domain,
                                     lobby_name,
                                     lobby_password,
                                     client_version,
-                                    chat_public_key,
                                 } => {
                                     if is_registered {
                                         log::warn!(
@@ -1716,6 +2706,61 @@ async fn handle_connection_with_timeouts(
                                         );
                                         break;
                                     }
+
+                                    if protocol_version != SIGNALING_PROTOCOL_VERSION {
+                                        let error_msg = SignalingMessage::RegisterError {
+                                            message: format!(
+                                                "不支持的信令协议版本，要求 {}",
+                                                SIGNALING_PROTOCOL_VERSION
+                                            ),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&error_msg) {
+                                            send_text(&write, json).await;
+                                        }
+                                        break;
+                                    }
+
+                                    let virtual_ip_text =
+                                        match parse_virtual_ipv4(virtual_ip.as_deref()) {
+                                            Some(ip) => ip.to_string(),
+                                            None => {
+                                                let error_msg = SignalingMessage::RegisterError {
+                                                    message: "virtualIp 必须位于 10.126.126.1-254"
+                                                        .to_string(),
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&error_msg)
+                                                {
+                                                    send_text(&write, json).await;
+                                                }
+                                                continue;
+                                            }
+                                        };
+                                    let (cid, identity_key, derived_virtual_domain) =
+                                        match verify_registration_identity(
+                                            &challenge,
+                                            &lobby_name,
+                                            &virtual_ip_text,
+                                            &identity_public_key,
+                                            &challenge_signature,
+                                        ) {
+                                            Some(identity) => identity,
+                                            None => {
+                                                let error_msg = SignalingMessage::RegisterError {
+                                                    message: "身份公钥或 challengeSignature 无效"
+                                                        .to_string(),
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&error_msg)
+                                                {
+                                                    send_text(&write, json).await;
+                                                }
+                                                break;
+                                            }
+                                        };
+                                    let chat_public_key = Some(identity_key);
+                                    // The domain is an address derived from the authenticated
+                                    // public-key fingerprint. Never accept a caller-selected name.
+                                    let virtual_domain = Some(derived_virtual_domain);
+                                    let use_domain = _client_use_domain.or(Some(true));
 
                                     if !valid_text(&cid, MAX_CLIENT_ID_LEN, false)
                                         || !valid_text(&player_name, MAX_PLAYER_NAME_LEN, false)
@@ -1860,7 +2905,7 @@ async fn handle_connection_with_timeouts(
                                                 is_passwordless: lobby_password.is_empty(),
                                                 description: String::new(),
                                                 server_node: String::new(),
-                                                muted: std::collections::HashSet::new(),
+                                                muted: HashSet::new(),
                                                 chat_token: generate_chat_token(),
                                                 chat_token_epoch: 1,
                                             }
@@ -1890,6 +2935,7 @@ async fn handle_connection_with_timeouts(
                                     }
 
                                     // 保存客户端信息 only after all registration checks pass.
+                                    let new_session_generation = random_session_generation();
                                     let client_info = ClientInfo {
                                         player_id: cid.clone(),
                                         player_name: player_name.clone(),
@@ -1897,6 +2943,7 @@ async fn handle_connection_with_timeouts(
                                         virtual_domain: virtual_domain.clone(),
                                         use_domain,
                                         chat_public_key: chat_public_key.clone(),
+                                        session_generation: new_session_generation,
                                         sender: Arc::clone(&write),
                                         disconnect: disconnect_tx.clone(),
                                     };
@@ -1971,10 +3018,18 @@ async fn handle_connection_with_timeouts(
 
                                     client_id = Some(cid.clone());
                                     lobby_id = Some(lid.clone());
+                                    session_generation = new_session_generation;
                                     is_registered = true;
 
                                     if *disconnect_rx.borrow()
-                                        || !is_current_session(&lobbies, &lid, &cid, &write).await
+                                        || !is_current_session(
+                                            &lobbies,
+                                            &lid,
+                                            &cid,
+                                            session_generation,
+                                            &write,
+                                        )
+                                        .await
                                     {
                                         log::warn!(
                                             "注册提交后会话已失效，拒绝发送 token: client={}",
@@ -1997,6 +3052,8 @@ async fn handle_connection_with_timeouts(
 
                                     // 发送注册成功消息（携带房主/选项/禁言列表）
                                     let success_msg = SignalingMessage::RegisterSuccess {
+                                        client_id: cid.clone(),
+                                        session_generation,
                                         lobby_id: lid.clone(),
                                         host_id: Some(host_id_now),
                                         max_players: max_players_now,
@@ -2010,29 +3067,7 @@ async fn handle_connection_with_timeouts(
                                     }
 
                                     // 发送当前大厅内的玩家列表
-                                    let players = {
-                                        let lobbies_read = lobbies.read().await;
-                                        lobbies_read
-                                            .get(&lid)
-                                            .map(|lobby| {
-                                                lobby
-                                                    .clients
-                                                    .iter()
-                                                    .filter(|(id, _)| **id != cid)
-                                                    .map(|(_, info)| PlayerInfo {
-                                                        player_id: info.player_id.clone(),
-                                                        player_name: info.player_name.clone(),
-                                                        virtual_ip: info.virtual_ip.clone(),
-                                                        virtual_domain: info.virtual_domain.clone(),
-                                                        use_domain: info.use_domain,
-                                                        chat_public_key: info
-                                                            .chat_public_key
-                                                            .clone(),
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default()
-                                    };
+                                    let players = current_players(&lobbies, &lid, Some(&cid)).await;
                                     let players_list = SignalingMessage::PlayersList { players };
                                     if let Ok(json) = serde_json::to_string(&players_list) {
                                         send_text(&write, json).await;
@@ -2061,6 +3096,7 @@ async fn handle_connection_with_timeouts(
                                             virtual_domain: virtual_domain.clone(),
                                             use_domain,
                                             chat_public_key: chat_public_key.clone(),
+                                            session_generation,
                                         },
                                     )
                                     .await;
@@ -2070,6 +3106,24 @@ async fn handle_connection_with_timeouts(
                                         log::info!("客户端主动离开: peer={}", addr);
                                     }
                                     break;
+                                }
+                                SignalingMessage::PlayersListRequest => {
+                                    if !is_registered {
+                                        log::warn!("未注册客户端请求成员列表，关闭连接: {}", addr);
+                                        break;
+                                    }
+                                    let Some(lid) = lobby_id.as_deref() else {
+                                        break;
+                                    };
+                                    let players =
+                                        current_players(&lobbies, lid, client_id.as_deref()).await;
+                                    if let Ok(json) =
+                                        serde_json::to_string(&SignalingMessage::PlayersList {
+                                            players,
+                                        })
+                                    {
+                                        send_text(&write, json).await;
+                                    }
                                 }
                                 SignalingMessage::Offer {
                                     from, to, offer, ..
@@ -2999,6 +4053,240 @@ async fn handle_connection_with_timeouts(
                                         }
                                     }
                                 }
+                                SignalingMessage::ShareUpdated {
+                                    from,
+                                    share_id,
+                                    share_name,
+                                    player_name,
+                                    has_password,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    broadcast_to_lobby(
+                                        &lobbies,
+                                        &lid,
+                                        &from,
+                                        SignalingMessage::ShareUpdated {
+                                            from: from.clone(),
+                                            share_id,
+                                            share_name,
+                                            player_name,
+                                            has_password,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                SignalingMessage::RemoteControlRequest {
+                                    from,
+                                    to,
+                                    session_id,
+                                    from_name,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlRequest {
+                                        from,
+                                        to,
+                                        session_id,
+                                        from_name,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlAccept {
+                                    from,
+                                    to,
+                                    session_id,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlAccept {
+                                        from,
+                                        to,
+                                        session_id,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlReject {
+                                    from,
+                                    to,
+                                    session_id,
+                                    reason,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlReject {
+                                        from,
+                                        to,
+                                        session_id,
+                                        reason,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlOffer {
+                                    from,
+                                    to,
+                                    session_id,
+                                    offer,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlOffer {
+                                        from,
+                                        to,
+                                        session_id,
+                                        offer,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlAnswer {
+                                    from,
+                                    to,
+                                    session_id,
+                                    answer,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlAnswer {
+                                        from,
+                                        to,
+                                        session_id,
+                                        answer,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlIce {
+                                    from,
+                                    to,
+                                    session_id,
+                                    candidate,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlIce {
+                                        from,
+                                        to,
+                                        session_id,
+                                        candidate,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SignalingMessage::RemoteControlStop {
+                                    from,
+                                    to,
+                                    session_id,
+                                } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let lid = match client_lobby_map.read().await.get(&from) {
+                                        Some(id) => id.clone(),
+                                        None => continue,
+                                    };
+                                    let target_id = to.clone();
+                                    let message = SignalingMessage::RemoteControlStop {
+                                        from,
+                                        to,
+                                        session_id,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let _ = send_to_lobby_client(
+                                            &lobbies,
+                                            &lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 SignalingMessage::Ping => {
                                     // 心跳检测：立即回复 pong，保持连接存活
                                     // 注意：浏览器/WebView 的 WebSocket API 无法发送协议级 ping 帧，
@@ -3058,9 +4346,11 @@ async fn handle_connection_with_timeouts(
                                     submitter,
                                 } => {
                                     // 投稿共享节点：无需注册（用户可能还没进大厅就想分享节点）
-                                    let resp = handle_community_node_submit(
+                                    let resp = handle_community_node_submit_with_limits(
                                         &community_nodes,
                                         &submit_cooldowns,
+                                        &submit_quotas,
+                                        &probe_limiter,
                                         addr,
                                         name,
                                         address,
@@ -3087,6 +4377,7 @@ async fn handle_connection_with_timeouts(
                                     // 校验房主身份并取出目标 sender
                                     let mut target_sender = None;
                                     let mut target_disconnect = None;
+                                    let mut target_generation = 0u64;
                                     let mut target_removed = false;
                                     let mut chat_rotation = None;
                                     {
@@ -3102,6 +4393,7 @@ async fn handle_connection_with_timeouts(
                                             if let Some(t) = lobby.clients.remove(&target) {
                                                 target_sender = Some(Arc::clone(&t.sender));
                                                 target_disconnect = Some(t.disconnect.clone());
+                                                target_generation = t.session_generation;
                                                 lobby.muted.remove(&target);
                                                 target_removed = true;
                                                 let (token, epoch) = rotate_chat_token(lobby);
@@ -3149,6 +4441,7 @@ async fn handle_connection_with_timeouts(
                                         &target,
                                         SignalingMessage::PlayerLeft {
                                             player_id: target.clone(),
+                                            session_generation: target_generation,
                                         },
                                     )
                                     .await;
@@ -3183,7 +4476,20 @@ async fn handle_connection_with_timeouts(
                                                 log::warn!("🚫 非房主尝试禁言: {}", from);
                                                 continue;
                                             }
+                                            if !lobby.clients.contains_key(&target) {
+                                                log::warn!(
+                                                    "🚫 房主尝试禁言不在大厅内的成员: {}",
+                                                    target
+                                                );
+                                                continue;
+                                            }
                                             if muted {
+                                                if lobby.muted.len() >= MAX_LOBBY_MEMBERS
+                                                    && !lobby.muted.contains(&target)
+                                                {
+                                                    log::warn!("🚫 大厅禁言集合已达上限: {}", lid);
+                                                    continue;
+                                                }
                                                 lobby.muted.insert(target.clone());
                                             } else {
                                                 lobby.muted.remove(&target);
@@ -3316,112 +4622,6 @@ async fn handle_connection_with_timeouts(
                                         .await;
                                     }
                                 }
-                                SignalingMessage::Forward => {
-                                    // 检查客户端是否已注册
-                                    if !is_registered {
-                                        log::warn!("🚫 未注册的客户端尝试转发消息，拒绝: {}", addr);
-                                        break;
-                                    }
-
-                                    // 解析原始JSON以获取from和to字段
-                                    if let Ok(json_value) =
-                                        serde_json::from_str::<serde_json::Value>(text)
-                                    {
-                                        // 检查消息类型
-                                        let msg_type =
-                                            json_value.get("type").and_then(|v| v.as_str());
-
-                                        // 文件共享广播消息（share-added, share-removed, share-updated）
-                                        if matches!(
-                                            msg_type,
-                                            Some("share-added")
-                                                | Some("share-removed")
-                                                | Some("share-updated")
-                                        ) {
-                                            if let Some(from) =
-                                                json_value.get("from").and_then(|v| v.as_str())
-                                            {
-                                                log::debug!(
-                                                    "广播文件共享消息: {:?} from {}",
-                                                    msg_type,
-                                                    from
-                                                );
-
-                                                // 获取发送者所在大厅
-                                                let lid = match client_lobby_map
-                                                    .read()
-                                                    .await
-                                                    .get(from)
-                                                {
-                                                    Some(id) => id.clone(),
-                                                    None => {
-                                                        log::warn!("发送者不在任何大厅: {}", from);
-                                                        continue;
-                                                    }
-                                                };
-
-                                                // 广播给大厅内所有其他客户端
-                                                let senders = {
-                                                    let lobbies_read = lobbies.read().await;
-                                                    lobbies_read
-                                                        .get(&lid)
-                                                        .map(|lobby| {
-                                                            lobby
-                                                                .clients
-                                                                .iter()
-                                                                .filter(|(id, _)| {
-                                                                    id.as_str() != from
-                                                                })
-                                                                .map(|(_, client)| {
-                                                                    Arc::clone(&client.sender)
-                                                                })
-                                                                .collect::<Vec<_>>()
-                                                        })
-                                                        .unwrap_or_default()
-                                                };
-                                                let sends = senders.into_iter().map(|sender| {
-                                                    let text = text.to_string();
-                                                    async move { send_text(&sender, text).await }
-                                                });
-                                                let _ = join_all(sends).await;
-                                                continue;
-                                            }
-                                        }
-
-                                        // 点对点转发消息（需要to字段）
-                                        if let (Some(from), Some(to)) = (
-                                            json_value.get("from").and_then(|v| v.as_str()),
-                                            json_value.get("to").and_then(|v| v.as_str()),
-                                        ) {
-                                            log::debug!("转发消息 from {} to {}", from, to);
-
-                                            // 获取发送者所在大厅
-                                            let lid = match client_lobby_map.read().await.get(from)
-                                            {
-                                                Some(id) => id.clone(),
-                                                None => {
-                                                    log::warn!("发送者不在任何大厅: {}", from);
-                                                    continue;
-                                                }
-                                            };
-
-                                            // 转发到目标客户端（必须在同一大厅）
-                                            if !send_to_lobby_client(
-                                                &lobbies,
-                                                &lid,
-                                                to,
-                                                Message::Text(text.to_string()),
-                                            )
-                                            .await
-                                            {
-                                                log::warn!(
-                                                    "目标客户端不在同一大厅或发送失败: {}",
-                                                    to
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
                                 _ => {
                                     log::warn!("未知消息类型");
                                 }
@@ -3430,32 +4630,19 @@ async fn handle_connection_with_timeouts(
                         Err(e) => {
                             let error_msg = e.to_string();
                             log::error!("解析消息失败: {}", error_msg);
-
-                            // 检查是否是旧版本客户端（缺少必需字段）
-                            if error_msg.contains("missing field") {
-                                log::warn!(
-                                    "🚫 检测到旧版本客户端（缺少必需字段），拒绝连接: {}",
-                                    addr
-                                );
-
-                                // 尝试发送错误消息（如果可能）
-                                let error_response = SignalingMessage::RegisterError {
-                                    message: format!("您的客户端版本过低，不支持大厅隔离功能。请访问 {} 下载最新版本。", client_download_url()),
-                                };
-                                if let Ok(json) = serde_json::to_string(&error_response) {
-                                    send_text(&write, json).await;
-                                }
-
-                                // 等待消息发送后强制断开连接
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                break;
+                            let error_response = SignalingMessage::RegisterError {
+                                message: if error_msg.contains("unknown variant") {
+                                    "不支持的信令消息类型".to_string()
+                                } else if !is_registered {
+                                    "请先使用 register-v3 完成注册".to_string()
+                                } else {
+                                    "信令消息格式无效".to_string()
+                                },
+                            };
+                            if let Ok(json) = serde_json::to_string(&error_response) {
+                                send_text(&write, json).await;
                             }
-
-                            // 如果客户端还未注册就发送了其他消息，也拒绝连接
-                            if !is_registered {
-                                log::warn!("🚫 未注册的客户端尝试发送消息，拒绝连接: {}", addr);
-                                break;
-                            }
+                            break;
                         }
                     }
                 } else if msg.is_close() {
@@ -3539,6 +4726,7 @@ async fn handle_connection_with_timeouts(
             &cid,
             SignalingMessage::PlayerLeft {
                 player_id: cid.clone(),
+                session_generation,
             },
         )
         .await;
@@ -3562,6 +4750,33 @@ async fn handle_connection_with_timeouts(
     Ok(())
 }
 
+async fn current_players(
+    lobbies: &Lobbies,
+    lobby_id: &str,
+    exclude_id: Option<&str>,
+) -> Vec<PlayerInfo> {
+    let lobbies_read = lobbies.read().await;
+    lobbies_read
+        .get(lobby_id)
+        .map(|lobby| {
+            lobby
+                .clients
+                .iter()
+                .filter(|(id, _)| exclude_id.is_none_or(|exclude| id.as_str() != exclude))
+                .map(|(_, info)| PlayerInfo {
+                    player_id: info.player_id.clone(),
+                    player_name: info.player_name.clone(),
+                    virtual_ip: info.virtual_ip.clone(),
+                    virtual_domain: info.virtual_domain.clone(),
+                    use_domain: info.use_domain,
+                    chat_public_key: info.chat_public_key.clone(),
+                    session_generation: info.session_generation,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 广播消息到大厅内所有客户端（排除指定客户端）
 async fn broadcast_to_lobby(
     lobbies: &Lobbies,
@@ -3570,25 +4785,40 @@ async fn broadcast_to_lobby(
     message: SignalingMessage,
 ) {
     if let Ok(json) = serde_json::to_string(&message) {
-        let senders = {
+        let source_id = json_sender_id(&json);
+        let (senders, generation) = {
             let lobbies_read = lobbies.read().await;
-            lobbies_read
-                .get(lobby_id)
-                .map(|lobby| {
-                    lobby
-                        .clients
-                        .iter()
-                        .filter(|(id, _)| id.as_str() != exclude_id)
-                        .map(|(_, client)| Arc::clone(&client.sender))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+            let Some(lobby) = lobbies_read.get(lobby_id) else {
+                return;
+            };
+            let generation = source_id
+                .as_deref()
+                .and_then(|source_id| lobby.clients.get(source_id))
+                .map(|source| source.session_generation);
+            let senders = lobby
+                .clients
+                .iter()
+                .filter(|(id, _)| id.as_str() != exclude_id)
+                .map(|(_, client)| (Arc::clone(&client.sender), client.disconnect.clone()))
+                .collect::<Vec<_>>();
+            (senders, generation)
         };
-
+        let json = generation
+            .zip(source_id.as_deref())
+            .map(|(generation, source_id)| {
+                inject_session_metadata(json.clone(), source_id, generation)
+            })
+            .unwrap_or(json);
         // 只在锁内复制发送端句柄；实际网络写入全部在锁外执行。
-        let sends = senders.into_iter().map(|sender| {
+        let sends = senders.into_iter().map(|(sender, disconnect)| {
             let message = Message::Text(json.clone());
-            async move { send_message(&sender, message).await }
+            async move {
+                let ok = send_message(&sender, message).await;
+                if !ok {
+                    let _ = disconnect.send(true);
+                }
+                ok
+            }
         });
         let _ = join_all(sends).await;
     }
@@ -3618,7 +4848,7 @@ async fn send_chat_token_rotation(
                     .clients
                     .get(&client_id)
                     .filter(|client| Arc::ptr_eq(&client.sender, &sender))
-                    .map(|_| sender)
+                    .map(|client| (sender, client.disconnect.clone()))
             })
             .collect::<Vec<_>>()
     };
@@ -3630,9 +4860,15 @@ async fn send_chat_token_rotation(
     let Ok(json) = serde_json::to_string(&message) else {
         return;
     };
-    let sends = senders.into_iter().map(|sender| {
+    let sends = senders.into_iter().map(|(sender, disconnect)| {
         let json = json.clone();
-        async move { send_text(&sender, json).await }
+        async move {
+            let ok = send_text(&sender, json).await;
+            if !ok {
+                let _ = disconnect.send(true);
+            }
+            ok
+        }
     });
     let _ = join_all(sends).await;
 }
@@ -3640,6 +4876,8 @@ async fn send_chat_token_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::pkcs8::EncodePublicKey;
     use serde_json::Value;
     use std::future::pending;
     use tokio::io::{AsyncRead, AsyncWrite};
@@ -3759,9 +4997,12 @@ mod tests {
         )
         .await;
         let (sink, _read) = ws_stream.split();
-        let sender = Arc::new(RwLock::new(sink));
+        let sender = Arc::new(ClientSenderState {
+            sink: RwLock::new(sink),
+            budget: Mutex::new(OutboundBudget::new()),
+        });
         let (disconnect, _disconnect_rx) = watch::channel(false);
-        let _busy_sender = sender.write().await;
+        let _busy_sender = sender.sink.write().await;
 
         let mut clients = HashMap::new();
         clients.insert(
@@ -3773,6 +5014,7 @@ mod tests {
                 virtual_domain: None,
                 use_domain: None,
                 chat_public_key: None,
+                session_generation: 1,
                 sender: Arc::clone(&sender),
                 disconnect,
             },
@@ -3790,7 +5032,7 @@ mod tests {
                 is_passwordless: true,
                 description: String::new(),
                 server_node: String::new(),
-                muted: std::collections::HashSet::new(),
+                muted: HashSet::new(),
                 chat_token: generate_chat_token(),
                 chat_token_epoch: 1,
             },
@@ -3804,6 +5046,7 @@ mod tests {
                 "",
                 SignalingMessage::PlayerLeft {
                     player_id: "other".to_string(),
+                    session_generation: 1,
                 },
             ) => None,
         };
@@ -3850,50 +5093,68 @@ mod tests {
         let (mut client, _) = connect_async(format!("ws://{}", address))
             .await
             .expect("WebSocket handshake should succeed");
-        let register = SignalingMessage::Register {
-            client_id: "test-client".to_string(),
-            player_name: "Test Player".to_string(),
-            virtual_ip: Some("10.126.126.10".to_string()),
-            virtual_domain: None,
-            use_domain: None,
-            lobby_name: "test-lobby".to_string(),
-            lobby_password: "test-password".to_string(),
-            client_version: Some(TEST_CLIENT_VERSION.to_string()),
-            chat_public_key: None,
-        };
-        client
-            .send(Message::Text(
-                serde_json::to_string(&register).expect("register should serialize"),
-            ))
-            .await
-            .expect("register should send");
+        send_register_with_ip(
+            &mut client,
+            "test-client",
+            "test-lobby",
+            "test-password",
+            "10.126.126.10",
+        )
+        .await;
 
-        let register_success = client
-            .next()
-            .await
-            .expect("register-success should arrive")
-            .expect("register-success should be valid WebSocket message");
-        let players_list = client
-            .next()
-            .await
-            .expect("players-list should arrive")
-            .expect("players-list should be valid WebSocket message");
+        let register_success = next_json(&mut client).await;
+        let players_list = next_json(&mut client).await;
         assert!(matches!(
-            serde_json::from_str::<SignalingMessage>(
-                register_success.to_text().expect("text response")
-            )
-            .expect("register-success should parse"),
+            serde_json::from_value::<SignalingMessage>(register_success)
+                .expect("register-success should parse"),
             SignalingMessage::RegisterSuccess { .. }
         ));
         assert!(matches!(
-            serde_json::from_str::<SignalingMessage>(
-                players_list.to_text().expect("text response")
-            )
-            .expect("players-list should parse"),
+            serde_json::from_value::<SignalingMessage>(players_list)
+                .expect("players-list should parse"),
             SignalingMessage::PlayersList { .. }
         ));
 
         client.close(None).await.expect("client close should send");
+        server_task.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_register_protocol_is_rejected_after_challenge() {
+        let (address, server_task) =
+            start_connection_server(tokio::time::Duration::from_secs(1)).await;
+        let (mut client, _) = connect_async(format!("ws://{}", address))
+            .await
+            .expect("WebSocket handshake should succeed");
+        let _challenge = next_server_challenge(&mut client).await;
+        client
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "register",
+                    "clientId": "legacy",
+                    "playerName": "Legacy",
+                    "virtualIp": "10.126.126.10",
+                    "lobbyName": "room",
+                    "lobbyPassword": "password",
+                    "clientVersion": TEST_CLIENT_VERSION
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("legacy registration should send");
+        let error = next_json(&mut client).await;
+        assert_eq!(error["type"], "register-error");
+        assert!(error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("register-v3"));
+        match timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("legacy protocol should be closed")
+        {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+            Some(Ok(message)) => panic!("legacy session remained open with {message:?}"),
+        }
         server_task.await.expect("test server task should finish");
     }
 
@@ -3912,14 +5173,9 @@ mod tests {
             ))
             .await
             .expect("ping should send");
-        let pong = client
-            .next()
-            .await
-            .expect("pong should arrive before deadline")
-            .expect("pong should be valid WebSocket message");
+        let pong = next_json(&mut client).await;
         assert!(matches!(
-            serde_json::from_str::<SignalingMessage>(pong.to_text().expect("text response"))
-                .expect("pong should parse"),
+            serde_json::from_value::<SignalingMessage>(pong).expect("pong should parse"),
             SignalingMessage::Pong
         ));
 
@@ -4029,9 +5285,38 @@ mod tests {
                 .await
                 .expect("test WebSocket closed before receiving JSON");
             if let Message::Text(text) = message {
-                return serde_json::from_str(&text).unwrap();
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "server-challenge" {
+                    continue;
+                }
+                return value;
             }
         }
+    }
+
+    async fn next_server_challenge<S>(socket: &mut WebSocketStream<S>) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let value = loop {
+            let message = next_frame(socket)
+                .await
+                .expect("test WebSocket closed before receiving challenge");
+            if let Message::Text(text) = message {
+                break serde_json::from_str::<Value>(&text).unwrap();
+            }
+        };
+        assert_eq!(value["type"], "server-challenge");
+        assert_eq!(value["protocolVersion"], SIGNALING_PROTOCOL_VERSION);
+        let challenge = value["challenge"]
+            .as_str()
+            .expect("challenge must be text")
+            .to_string();
+        assert_eq!(challenge.len(), CHALLENGE_BYTES * 2);
+        assert!(challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        challenge
     }
 
     fn test_virtual_ip(client_id: &str) -> String {
@@ -4040,16 +5325,51 @@ mod tests {
         format!("10.126.126.{host}")
     }
 
-    fn register_message_with_ip(
+    fn test_signing_key(label: &str) -> SigningKey {
+        let mut bytes = [0u8; 32];
+        let digest = Sha256::digest(format!("mctier-test-identity:{label}").as_bytes());
+        bytes.copy_from_slice(&digest);
+        for _ in 0..256 {
+            if let Ok(key) = SigningKey::from_slice(&bytes) {
+                return key;
+            }
+            bytes[31] = bytes[31].wrapping_add(1);
+        }
+        panic!("unable to derive a test P-256 key");
+    }
+
+    fn test_identity_key(label: &str) -> (SigningKey, String, String) {
+        let key = test_signing_key(label);
+        let der = key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("test public key should encode");
+        let encoded = BASE64_STANDARD.encode(der.as_bytes());
+        let digest = Sha256::digest(der.as_bytes());
+        let client_id = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        (key, encoded, client_id)
+    }
+
+    fn test_client_id(label: &str) -> String {
+        test_identity_key(label).2
+    }
+
+    fn register_message_for_challenge(
         client_id: &str,
         lobby_name: &str,
         lobby_password: &str,
         virtual_ip: &str,
+        challenge: &str,
     ) -> Message {
+        let (key, identity_public_key, _) = test_identity_key(client_id);
+        let signature: p256::ecdsa::Signature =
+            key.sign(&registration_canonical(challenge, lobby_name, virtual_ip));
         Message::Text(
             serde_json::json!({
-                "type": "register",
-                "clientId": client_id,
+                "type": "register-v3",
+                "protocolVersion": SIGNALING_PROTOCOL_VERSION,
+                "identityPublicKey": identity_public_key,
+                "challengeSignature": BASE64_STANDARD.encode(signature.to_der().as_bytes()),
                 "playerName": client_id,
                 "virtualIp": virtual_ip,
                 "lobbyName": lobby_name,
@@ -4060,33 +5380,26 @@ mod tests {
         )
     }
 
-    fn register_message_with_chat_key(
+    async fn send_register_with_ip<S>(
+        socket: &mut WebSocketStream<S>,
         client_id: &str,
         lobby_name: &str,
-        chat_public_key: &str,
-    ) -> Message {
-        Message::Text(
-            serde_json::json!({
-                "type": "register",
-                "clientId": client_id,
-                "playerName": client_id,
-                "virtualIp": test_virtual_ip(client_id),
-                "lobbyName": lobby_name,
-                "lobbyPassword": "password",
-                "clientVersion": TEST_CLIENT_VERSION,
-                "chatPublicKey": chat_public_key
-            })
-            .to_string(),
-        )
-    }
-
-    fn register_message(client_id: &str, lobby_name: &str, lobby_password: &str) -> Message {
-        register_message_with_ip(
-            client_id,
-            lobby_name,
-            lobby_password,
-            &test_virtual_ip(client_id),
-        )
+        lobby_password: &str,
+        virtual_ip: &str,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let challenge = next_server_challenge(socket).await;
+        socket
+            .send(register_message_for_challenge(
+                client_id,
+                lobby_name,
+                lobby_password,
+                virtual_ip,
+                &challenge,
+            ))
+            .await
+            .unwrap();
     }
 
     async fn register<S>(
@@ -4097,10 +5410,14 @@ mod tests {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        socket
-            .send(register_message(client_id, lobby_name, "password"))
-            .await
-            .unwrap();
+        send_register_with_ip(
+            socket,
+            client_id,
+            lobby_name,
+            "password",
+            &test_virtual_ip(client_id),
+        )
+        .await;
         let success = next_json(socket).await;
         assert_eq!(success["type"], "register-success");
         assert_eq!(next_json(socket).await["type"], "players-list");
@@ -4117,10 +5434,13 @@ mod tests {
 
     #[test]
     fn extracts_sender_from_forwarded_message() {
-        let raw = r#"{"type":"remote-control-request","from":"controller-id","to":"phone-id"}"#;
+        let raw = r#"{"type":"remote-control-request","from":"controller-id","to":"phone-id","sessionId":"rc-1","fromName":"Controller"}"#;
         let message: SignalingMessage = serde_json::from_str(raw).unwrap();
 
-        assert!(matches!(message, SignalingMessage::Forward));
+        assert!(matches!(
+            message,
+            SignalingMessage::RemoteControlRequest { .. }
+        ));
         assert_eq!(
             message.claimed_sender(raw).as_deref(),
             Some("controller-id")
@@ -4160,20 +5480,103 @@ mod tests {
     }
 
     #[test]
+    fn registration_proof_is_bound_to_challenge_lobby_and_virtual_ip() {
+        let challenge = "ab".repeat(CHALLENGE_BYTES);
+        let (key, encoded_key, expected_id) = test_identity_key("proof-owner");
+        let signature: p256::ecdsa::Signature =
+            key.sign(&registration_canonical(&challenge, "room", "10.126.126.7"));
+        let (client_id, stored_key, virtual_domain) = verify_registration_identity(
+            &challenge,
+            "room",
+            "10.126.126.7",
+            &encoded_key,
+            &BASE64_STANDARD.encode(signature.to_der().as_bytes()),
+        )
+        .expect("valid P-256 proof should verify");
+        assert_eq!(client_id, expected_id);
+        assert_eq!(stored_key, encoded_key);
+        assert_eq!(virtual_domain, format!("{}.mct.net", &expected_id[..32]));
+
+        let wrong_lobby = verify_registration_identity(
+            &challenge,
+            "other-room",
+            "10.126.126.7",
+            &encoded_key,
+            &BASE64_STANDARD.encode(signature.to_der().as_bytes()),
+        );
+        assert!(wrong_lobby.is_none(), "proof must include the lobby name");
+        assert!(
+            verify_registration_identity(
+                &challenge,
+                "room",
+                "10.126.126.8",
+                &encoded_key,
+                &BASE64_STANDARD.encode(signature.to_der().as_bytes()),
+            )
+            .is_none(),
+            "proof must include the virtual IP"
+        );
+    }
+
+    #[test]
+    fn message_and_outbound_budgets_are_bounded() {
+        let mut inbound = MessageRateLimiter::new();
+        for _ in 0..MAX_MESSAGES_PER_WINDOW {
+            assert!(inbound.allow());
+        }
+        assert!(!inbound.allow());
+
+        let mut outbound = OutboundBudget::new();
+        for _ in 0..MAX_OUTBOUND_FRAMES_PER_WINDOW {
+            assert!(outbound.allow(1));
+        }
+        assert!(!outbound.allow(1));
+        assert!(valid_session_description(
+            "offer",
+            "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n",
+            "offer"
+        ));
+        assert!(!valid_session_description("offer", "v=0\u{0000}", "offer"));
+    }
+
+    #[test]
+    fn peer_metadata_is_canonicalized_on_server_output() {
+        let raw = serde_json::json!({
+            "type": "offer",
+            "from": "attacker",
+            "to": "peer",
+            "sessionGeneration": 1,
+            "offer": {"type": "offer", "sdp": "v=0"}
+        })
+        .to_string();
+        let value: Value =
+            serde_json::from_str(&inject_session_metadata(raw, "canonical-peer", 42)).unwrap();
+        assert_eq!(value["from"], "canonical-peer");
+        assert_eq!(value["sessionGeneration"], 42);
+    }
+
+    #[test]
+    fn community_submit_quota_has_a_fixed_source_budget() {
+        let mut quota = SubmitQuota {
+            window_started: tokio::time::Instant::now(),
+            submissions: 0,
+        };
+        for _ in 0..COMMUNITY_NODE_SUBMIT_MAX_PER_WINDOW {
+            assert!(allow_submit_quota(&mut quota));
+        }
+        assert!(!allow_submit_quota(&mut quota));
+    }
+
+    #[test]
     fn forwarded_message_without_string_sender_does_not_claim_identity() {
         let raw = r#"{"type":"remote-control-request","from":123,"to":"phone-id"}"#;
-        let message: SignalingMessage = serde_json::from_str(raw).unwrap();
-
-        assert!(matches!(message, SignalingMessage::Forward));
-        assert_eq!(message.claimed_sender(raw), None);
+        assert!(serde_json::from_str::<SignalingMessage>(raw).is_err());
     }
 
     #[test]
     fn chat_public_keys_are_shape_checked_before_entering_a_roster() {
-        // Well formed base64 of a plausible DER length is accepted.
-        assert!(valid_chat_public_key(
-            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
-        ));
+        let (_, valid_key, _) = test_identity_key("valid-key");
+        assert!(valid_chat_public_key(&valid_key));
         assert!(!valid_chat_public_key(""));
         // Anything outside the base64 alphabet is refused, which keeps quoting
         // and injection tricks out of a field that is later echoed to peers.
@@ -4184,11 +5587,10 @@ mod tests {
             &"A".repeat(MAX_CHAT_PUBLIC_KEY_LEN + 1)
         ));
 
-        // Normalization trims but never repairs: invalid input becomes None so
-        // an old client can still join, just without signing capability.
+        // Normalization trims but never repairs malformed input.
         assert_eq!(
             normalize_chat_public_key(Some("  AAAA  ".to_string())),
-            Some("AAAA".to_string())
+            None
         );
         assert_eq!(normalize_chat_public_key(Some("!!".to_string())), None);
         assert_eq!(normalize_chat_public_key(None), None);
@@ -4198,29 +5600,44 @@ mod tests {
     async fn chat_public_keys_reach_peers_bound_to_their_owner() {
         let (address, server) = spawn_test_server().await;
         let url = format!("ws://{address}");
-        let host_key = "SG9zdEtleQ==";
-        let peer_key = "UGVlcktleQ==";
-
         let (mut host, _) = connect_async(&url).await.unwrap();
-        host.send(register_message_with_chat_key("host-id", "room", host_key))
-            .await
-            .unwrap();
-        assert_eq!(next_json(&mut host).await["type"], "register-success");
+        send_register_with_ip(
+            &mut host,
+            "host-id",
+            "room",
+            "password",
+            &test_virtual_ip("host-id"),
+        )
+        .await;
+        let host_success = next_json(&mut host).await;
+        assert_eq!(host_success["type"], "register-success");
         assert_eq!(next_json(&mut host).await["type"], "players-list");
 
         let (mut peer, _) = connect_async(&url).await.unwrap();
-        peer.send(register_message_with_chat_key("peer-id", "room", peer_key))
-            .await
-            .unwrap();
-        assert_eq!(next_json(&mut peer).await["type"], "register-success");
+        send_register_with_ip(
+            &mut peer,
+            "peer-id",
+            "room",
+            "password",
+            &test_virtual_ip("peer-id"),
+        )
+        .await;
+        let peer_success = next_json(&mut peer).await;
+        assert_eq!(peer_success["type"], "register-success");
 
         // The joiner's roster must carry the host's key, bound to the host id.
         let roster = next_json(&mut peer).await;
         assert_eq!(roster["type"], "players-list");
         let players = roster["players"].as_array().unwrap();
         assert_eq!(players.len(), 1);
-        assert_eq!(players[0]["playerId"], "host-id");
+        let (_, host_key, host_id) = test_identity_key("host-id");
+        let (_, peer_key, peer_id) = test_identity_key("peer-id");
+        assert_eq!(players[0]["playerId"], host_id);
         assert_eq!(players[0]["chatPublicKey"], host_key);
+        assert_eq!(
+            players[0]["sessionGeneration"],
+            host_success["sessionGeneration"]
+        );
 
         // And the incremental join event must carry the joiner's own key, so a
         // member never has to guess which key belongs to which player.
@@ -4228,8 +5645,12 @@ mod tests {
         assert_eq!(rotated["type"], "chat-token-rotated");
         let joined = next_json(&mut host).await;
         assert_eq!(joined["type"], "player-joined");
-        assert_eq!(joined["playerId"], "peer-id");
+        assert_eq!(joined["playerId"], peer_id);
         assert_eq!(joined["chatPublicKey"], peer_key);
+        assert_eq!(
+            joined["sessionGeneration"],
+            peer_success["sessionGeneration"]
+        );
 
         server.abort();
     }
@@ -4295,15 +5716,14 @@ mod tests {
         .enumerate()
         {
             let (mut socket, _) = connect_async(&url).await.unwrap();
-            socket
-                .send(register_message_with_ip(
-                    &format!("invalid-{index}"),
-                    "room",
-                    "password",
-                    ip,
-                ))
-                .await
-                .unwrap();
+            send_register_with_ip(
+                &mut socket,
+                &format!("invalid-{index}"),
+                "room",
+                "password",
+                ip,
+            )
+            .await;
             assert_eq!(next_json(&mut socket).await["type"], "register-error");
             socket.close(None).await.unwrap();
         }
@@ -4311,15 +5731,14 @@ mod tests {
         let (mut host, _) = connect_async(&url).await.unwrap();
         register(&mut host, "host-id", "room").await;
         let (mut duplicate_ip, _) = connect_async(&url).await.unwrap();
-        duplicate_ip
-            .send(register_message_with_ip(
-                "other-id",
-                "room",
-                "password",
-                &test_virtual_ip("host-id"),
-            ))
-            .await
-            .unwrap();
+        send_register_with_ip(
+            &mut duplicate_ip,
+            "other-id",
+            "room",
+            "password",
+            &test_virtual_ip("host-id"),
+        )
+        .await;
         assert_eq!(next_json(&mut duplicate_ip).await["type"], "register-error");
 
         server.abort();
@@ -4334,13 +5753,14 @@ mod tests {
 
         let (mut peer, _) = connect_async(&url).await.unwrap();
         register(&mut peer, "peer-id", "room").await;
+        let peer_id = test_client_id("peer-id");
         assert_eq!(next_json(&mut host).await["type"], "chat-token-rotated");
         assert_eq!(next_json(&mut host).await["type"], "player-joined");
 
         peer.send(Message::Text(
             serde_json::json!({
                 "type": "leave",
-                "clientId": "peer-id"
+                "clientId": peer_id
             })
             .to_string(),
         ))
@@ -4365,10 +5785,14 @@ mod tests {
         register(&mut first, "same-id", "same-room").await;
 
         let (mut duplicate, _) = connect_async(&url).await.unwrap();
-        duplicate
-            .send(register_message("same-id", "same-room", "password"))
-            .await
-            .unwrap();
+        send_register_with_ip(
+            &mut duplicate,
+            "same-id",
+            "same-room",
+            "password",
+            &test_virtual_ip("same-id"),
+        )
+        .await;
         assert_eq!(next_json(&mut duplicate).await["type"], "register-error");
         match timeout(Duration::from_secs(2), duplicate.next())
             .await
@@ -4398,14 +5822,16 @@ mod tests {
 
         let (mut peer, _) = connect_async(&url).await.unwrap();
         register(&mut peer, "peer-id", "room").await;
+        let host_id = test_client_id("host-id");
+        let peer_id = test_client_id("peer-id");
         assert_eq!(next_json(&mut host).await["type"], "chat-token-rotated");
         assert_eq!(next_json(&mut host).await["type"], "player-joined");
 
         peer.send(Message::Text(
             serde_json::json!({
                 "type": "kick-player",
-                "from": "host-id",
-                "target": "peer-id"
+                "from": host_id,
+                "target": peer_id
             })
             .to_string(),
         ))
@@ -4415,8 +5841,8 @@ mod tests {
         peer.send(Message::Text(
             serde_json::json!({
                 "type": "offer",
-                "from": "peer-id",
-                "to": "host-id",
+                "from": peer_id,
+                "to": host_id,
                 "offer": {"type": "offer", "sdp": "test"}
             })
             .to_string(),
@@ -4426,7 +5852,7 @@ mod tests {
 
         let offer = next_json(&mut host).await;
         assert_eq!(offer["type"], "offer");
-        assert_eq!(offer["from"], "peer-id");
+        assert_eq!(offer["from"], test_client_id("peer-id"));
 
         server.abort();
     }
@@ -4437,6 +5863,8 @@ mod tests {
         let url = format!("ws://{address}");
         let (mut host, _) = connect_async(&url).await.unwrap();
         register(&mut host, "host-id", "room").await;
+        let host_id = test_client_id("host-id");
+        let peer_id = test_client_id("peer-id");
 
         let (mut old_peer, _) = connect_async(&url).await.unwrap();
         register(&mut old_peer, "peer-id", "room").await;
@@ -4446,8 +5874,8 @@ mod tests {
         host.send(Message::Text(
             serde_json::json!({
                 "type": "kick-player",
-                "from": "host-id",
-                "target": "peer-id"
+                "from": host_id,
+                "target": peer_id
             })
             .to_string(),
         ))
@@ -4466,8 +5894,8 @@ mod tests {
             .send(Message::Text(
                 serde_json::json!({
                     "type": "offer",
-                    "from": "peer-id",
-                    "to": "host-id",
+                    "from": peer_id,
+                    "to": host_id,
                     "offer": {"type": "offer", "sdp": "stale"}
                 })
                 .to_string(),
@@ -4480,9 +5908,9 @@ mod tests {
         new_peer
             .send(Message::Text(
                 serde_json::json!({
-                    "type": "offer",
-                    "from": "peer-id",
-                    "to": "host-id",
+                "type": "offer",
+                "from": test_client_id("peer-id"),
+                "to": test_client_id("host-id"),
                     "offer": {"type": "offer", "sdp": "current"}
                 })
                 .to_string(),
@@ -4515,10 +5943,14 @@ mod tests {
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let (mut retry, _) = connect_async(&url).await.unwrap();
-            retry
-                .send(register_message("ghost-id", "room", "password"))
-                .await
-                .unwrap();
+            send_register_with_ip(
+                &mut retry,
+                "ghost-id",
+                "room",
+                "password",
+                &test_virtual_ip("ghost-id"),
+            )
+            .await;
             if next_json(&mut retry).await["type"] == "register-success" {
                 reconnected = true;
                 break;
@@ -4563,19 +5995,22 @@ mod tests {
         let url = format!("ws://{address}");
         let (mut host, _) = connect_async(&url).await.unwrap();
         register(&mut host, "host-a", "room-a").await;
+        let host_id = test_client_id("host-a");
 
         let (mut target, _) = connect_async(&url).await.unwrap();
         register(&mut target, "target-b", "room-b").await;
+        let target_id = test_client_id("target-b");
         let (mut peer, _) = connect_async(&url).await.unwrap();
         register(&mut peer, "peer-b", "room-b").await;
+        let peer_id = test_client_id("peer-b");
         assert_eq!(next_json(&mut target).await["type"], "chat-token-rotated");
         assert_eq!(next_json(&mut target).await["type"], "player-joined");
 
         host.send(Message::Text(
             serde_json::json!({
                 "type": "kick-player",
-                "from": "host-a",
-                "target": "target-b"
+                "from": host_id,
+                "target": target_id
             })
             .to_string(),
         ))
@@ -4589,8 +6024,8 @@ mod tests {
             .send(Message::Text(
                 serde_json::json!({
                     "type": "offer",
-                    "from": "target-b",
-                    "to": "peer-b",
+                    "from": target_id,
+                    "to": peer_id,
                     "offer": {"type": "offer", "sdp": "other-lobby"}
                 })
                 .to_string(),
