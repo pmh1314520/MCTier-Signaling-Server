@@ -2,7 +2,7 @@
 
 # MCTier 信令服务器一键部署脚本
 # 作者：青云制作_彭明航
-# 版本：2.0.0
+# 版本：2.1.0（仅部署信令容器；反向代理与证书由部署者自行处理）
 
 set -e
 
@@ -103,7 +103,7 @@ start_services() {
     print_info "构建并启动信令服务器..."
     print_warning "首次构建需要 5-10 分钟下载依赖包，请耐心等待..."
     
-    $DOCKER_COMPOSE_CMD -f docker-compose-http.yml up -d --build
+    $DOCKER_COMPOSE_CMD up -d --build
     
     if [ $? -eq 0 ]; then
         print_success "服务启动成功"
@@ -118,7 +118,7 @@ check_services() {
     print_info "检查服务状态..."
     sleep 5
     
-    $DOCKER_COMPOSE_CMD -f docker-compose-http.yml ps
+    $DOCKER_COMPOSE_CMD ps
     
     echo ""
     print_info "检查信令服务器健康状态..."
@@ -148,17 +148,18 @@ show_deployment_info() {
     echo -e "${GREEN}   部署完成！${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    print_info "信令服务器地址: ws://$SERVER_IP:8445"
+    print_info "信令容器已监听: 127.0.0.1:8445（仅本机）"
     echo ""
-    print_warning "当前使用 HTTP/WS 模式（未加密）"
-    print_info "如需启用 HTTPS/WSS，可使用仓库内的 docker-compose.yml（已含 Nginx + Certbot）"
-    print_info "详细步骤请参考 README.md 的\"配置 HTTPS/WSS\"章节"
+    print_warning "容器只绑定回环地址，公网访问需要你自己在宿主机配置反向代理与 TLS。"
+    print_info "反向代理需要把 WebSocket 升级头透传给 127.0.0.1:8445（Upgrade / Connection）。"
+    print_info "客户端最终填写的地址形如: wss://your-domain.com/signaling"
+    print_info "仅内网测试、不加反代时，可把 compose 里的端口改为 8445:8445（明文 WS，勿用于公网）。"
     echo ""
     print_info "常用命令："
-    echo "  查看日志: $DOCKER_COMPOSE_CMD -f docker-compose-http.yml logs -f"
-    echo "  重启服务: $DOCKER_COMPOSE_CMD -f docker-compose-http.yml restart"
-    echo "  停止服务: $DOCKER_COMPOSE_CMD -f docker-compose-http.yml down"
-    echo "  更新服务: $DOCKER_COMPOSE_CMD -f docker-compose-http.yml up -d --build"
+    echo "  查看日志: $DOCKER_COMPOSE_CMD logs -f"
+    echo "  重启服务: $DOCKER_COMPOSE_CMD restart"
+    echo "  停止服务: $DOCKER_COMPOSE_CMD down"
+    echo "  更新服务: $DOCKER_COMPOSE_CMD up -d --build"
     echo ""
     print_success "请在 MCTier 客户端设置中配置信令服务器地址"
     echo ""

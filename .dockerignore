@@ -12,8 +12,6 @@ target/
 
 # Docker / 部署相关（构建镜像时不需要）
 docker-compose.yml
-docker-compose-http.yml
-nginx.conf
 deploy.sh
 
 # 证书与环境变量（禁止进入镜像）

@@ -16,8 +16,10 @@
 *.p12
 *.pfx
 
-# Let's Encrypt / Certbot 运行时数据
+# 反向代理与证书由部署者自行处理，仓库不含相关运行时数据；
+# 这里仍然忽略常见的证书目录，防止有人把私钥放进仓库。
 certbot/
+letsencrypt/
 letsencrypt/
 
 # 日志

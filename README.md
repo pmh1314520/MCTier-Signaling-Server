@@ -12,7 +12,7 @@ P2P 通道，因此服务器带宽占用很低，1 核 512MB 的小机器即可�
 - [功能特性](#功能特性)
 - [快速开始](#快速开始)
 - [环境变量](#环境变量)
-- [配置 HTTPS/WSS](#配置-httpswss)
+- [反向代理与 HTTPS/WSS](#反向代理与-httpswss)
 - [服务管理](#服务管理)
 - [客户端配置](#客户端配置)
 - [本地开发](#本地开发)
@@ -50,7 +50,9 @@ sudo ./deploy.sh
 
 脚本会自动检查并安装 Docker 与 Docker Compose，构建镜像，启动服务并配置自动重启。
 
-部署完成后，信令服务器监听在 `ws://你的服务器IP:8445`。
+部署完成后，信令容器监听在 `127.0.0.1:8445`（**仅本机**）。
+对外提供服务需要你自己在宿主机上配一层反向代理，见
+[反向代理与 HTTPS/WSS](#反向代理与-httpswss)。
 
 ### 手动部署
 
@@ -62,14 +64,15 @@ systemctl enable --now docker
 # 2. 按需修改配置
 cp .env.example .env
 
-# 3. 启动服务（HTTP/WS 模式）
-docker compose -f docker-compose-http.yml up -d --build
+# 3. 启动服务
+docker compose up -d --build
 
 # 4. 查看日志
-docker compose -f docker-compose-http.yml logs -f
+docker compose logs -f
 ```
 
-记得在防火墙和云厂商安全组放行 `8445/tcp`。
+容器默认只绑定回环地址，因此**不需要**在防火墙放行 `8445`；
+需要放行的是你自己反向代理监听的端口（通常是 `443`）。
 
 ## 环境变量
 
@@ -89,65 +92,64 @@ docker compose -f docker-compose-http.yml logs -f
 修改环境变量后需要重建容器才会生效：
 
 ```bash
-docker compose -f docker-compose-http.yml up -d
-```
-
-## 配置 HTTPS/WSS
-
-默认部署是 HTTP/WS 模式。如果客户端需要走 `wss://`，或者你希望用域名而不是 IP，
-可以用仓库里的 `docker-compose.yml`，它额外带了 Nginx 反向代理和 Certbot 自动续期。
-
-前提条件：拥有一个域名、域名已解析到服务器 IP、服务器放行 80 和 443 端口。
-
-### 1. 修改 Nginx 配置中的域名
-
-```bash
-sed -i 's/your-domain.com/mctier.example.com/g' nginx.conf
-```
-
-### 2. 申请 SSL 证书
-
-```bash
-mkdir -p certbot/conf certbot/www
-
-# 先只启动 Nginx 用于域名验证
-docker compose up -d nginx
-
-# 申请 Let's Encrypt 免费证书
-docker compose run --rm certbot certonly \
-  --webroot --webroot-path=/var/www/certbot \
-  --email your-email@example.com \
-  --agree-tos --no-eff-email \
-  -d mctier.example.com
-```
-
-### 3. 启动全部服务
-
-```bash
-# 停掉 HTTP 模式
-docker compose -f docker-compose-http.yml down
-
-# 启动 HTTPS 模式
 docker compose up -d
 ```
 
-现在客户端可以使用 `wss://mctier.example.com/signaling` 连接。
+## 反向代理与 HTTPS/WSS
 
-HTTPS 模式下信令容器的 8445 端口不再直接对公网暴露，只允许 Nginx 通过内部网络访问。
+本仓库**只提供信令容器**，不内置 Nginx 与 Certbot：证书、域名和网关属于部署环境的
+私有配置，塞进 compose 往往会和服务器上已有的网关抢 80/443 端口。
+反向代理与 TLS 请按你自己的习惯处理（nginx / caddy / 云厂商负载均衡都可以）。
 
-### 使用已有的 SSL 证书
+容器默认监听 `127.0.0.1:8445`，反向代理只需把请求转发到这里。
 
-如果你已经有证书，把文件放到对应目录再启动即可：
+**唯一的硬性要求**：必须透传 WebSocket 升级头。信令走的是 WebSocket，
+少了 `Upgrade` / `Connection` 这两个头，握手会直接失败（客户端表现为连不上信令）。
 
-```bash
-mkdir -p certbot/conf/live/your-domain.com/
-# 放入 fullchain.pem（完整证书链）和 privkey.pem（私钥）
-docker compose up -d
+nginx 的最小配置示例：
+
+```nginx
+location /signaling {
+    proxy_pass http://127.0.0.1:8445;
+    proxy_http_version 1.1;
+
+    # WebSocket 握手必需
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    proxy_set_header Host $host;
+    # 服务器按来源 IP 做投稿限流，缺了这个头会把所有人算成同一个 IP
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    # 大厅内长时间无消息时不要掐断连接（服务器侧有 60s 空闲回收与心跳）
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
 ```
+
+caddy 的等价写法（自动签发证书，不需要额外配 TLS）：
+
+```caddy
+mctier.example.com {
+    reverse_proxy /signaling* 127.0.0.1:8445
+}
+```
+
+配好之后客户端填 `wss://mctier.example.com/signaling`。
+
+### 不想加反向代理（仅内网测试）
+
+把 `docker-compose.yml` 里的端口改成直接对外，然后放行 `8445/tcp`：
+
+```yaml
+ports:
+  - "8445:8445"
+```
+
+此时客户端填 `ws://你的服务器IP:8445`。**这是明文连接**，大厅密码等信令内容不加密，
+只适合内网自用，不要这样暴露到公网。
 
 ## 服务管理
-
-HTTP 模式把下面命令中的 `docker compose` 换成 `docker compose -f docker-compose-http.yml` 即可。
 
 ```bash
 # 查看日志
@@ -167,11 +169,11 @@ docker compose up -d --build
 在 MCTier 客户端的设置中填写信令服务器地址：
 
 ```
-# HTTP/WS 模式
-ws://你的服务器IP:8445
-
-# HTTPS/WSS 模式
+# 经反向代理（推荐，公网部署请用这个）
 wss://你的域名/signaling
+
+# 容器直连（仅内网测试；需先把端口改为 8445:8445，明文不加密）
+ws://你的服务器IP:8445
 ```
 
 EasyTier 节点服务器可以继续使用官方节点，也可以自建：
@@ -266,22 +268,40 @@ cargo build --release
   带密码的大厅仍会被公开且陌生人无从加入；只禁止带密码大厅公开，历史数据仍可能残留密码。
   因此"公开"等同于"任何看到广场的人都能进"，请据此决定是否公开。这两条都有单测覆盖。
 - **服务器本身没有账号体系**。它不做身份认证，任何能连上端口的客户端都可以注册。如果只想给朋友用，建议用防火墙限制来源 IP，或放在只有你们知道的域名后面。
-- **建议使用 WSS**。HTTP/WS 模式下信令内容（包括大厅密码）以明文传输，公网部署请配置 HTTPS/WSS。
-- **不要提交敏感文件**。`.gitignore` 已排除 `.env`、`certbot/` 和各类证书私钥，请勿手动强制添加。
+- **公网部署必须用 WSS**。明文 WS 会把信令内容（包括大厅密码）暴露在链路上。
+  容器默认只绑定 `127.0.0.1`，正是为了避免忘配 TLS 时把明文端口直接暴露出去；
+  改成 `8445:8445` 前请确认这条链路只在内网。
+- **反向代理需要透传 `X-Forwarded-For`**。共享节点投稿按来源 IP 限流，
+  缺这个头会让所有投稿都被算作同一个 IP，限流形同虚设。
+- **不要提交敏感文件**。`.gitignore` 已排除 `.env` 与各类证书私钥，请勿手动强制添加。
 
 ## 故障排查
 
 ### 无法连接到信令服务器
 
-先确认容器在运行（`docker compose ps`），再检查端口是否放行：
+先确认容器在运行（`docker compose ps`），再按下面的顺序排查：
 
-```bash
-# Ubuntu / Debian
-sudo ufw allow 8445/tcp
+1. **容器本身通不通**（绕过反向代理，直接在服务器上测）：
 
-# CentOS / RHEL
-sudo firewall-cmd --permanent --add-port=8445/tcp && sudo firewall-cmd --reload
-```
+   ```bash
+   nc -vz 127.0.0.1 8445
+   ```
+
+2. **反向代理有没有透传 WebSocket 升级头**。这是最常见的原因：普通 HTTP 反代配置
+   缺少 `Upgrade` / `Connection`，页面能打开但信令握不上手。参考
+   [反向代理与 HTTPS/WSS](#反向代理与-httpswss) 的示例配置。
+
+3. **防火墙 / 安全组放行的是反向代理的端口**（通常 `443`），而不是 `8445`——
+   容器默认只监听回环，放行 8445 没有意义。
+   仅当你把端口改成 `8445:8445` 直连时才需要放行它：
+
+   ```bash
+   # Ubuntu / Debian
+   sudo ufw allow 8445/tcp
+
+   # CentOS / RHEL
+   sudo firewall-cmd --permanent --add-port=8445/tcp && sudo firewall-cmd --reload
+   ```
 
 云服务器还需要在厂商控制台的安全组里放行对应端口。
 
@@ -292,37 +312,27 @@ sudo firewall-cmd --permanent --add-port=8445/tcp && sudo firewall-cmd --reload
 ### 查看详细日志
 
 ```bash
-docker compose -f docker-compose-http.yml logs --tail=100 mctier-signaling
+docker compose logs --tail=100 mctier-signaling
 
 # 需要更详细的信息时把日志级别调成 debug
-RUST_LOG=debug docker compose -f docker-compose-http.yml up -d
+RUST_LOG=debug docker compose up -d
 ```
 
 ### 测试连接是否通畅
 
 ```bash
-# 检查端口
-nc -vz 你的服务器IP 8445
+# 容器直连（在服务器本机执行）
+nc -vz 127.0.0.1 8445
 
-# HTTPS 模式检查 Nginx
-curl -I https://你的域名
+# 经反向代理的 WebSocket 握手：正常应返回 101 Switching Protocols
+curl -i -N \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  https://你的域名/signaling
 ```
 
-### SSL 证书申请失败
-
-确认域名已正确解析到服务器 IP、80 端口可从外网访问、服务器时间准确。需要重新申请时：
-
-```bash
-rm -rf certbot/conf/live/your-domain.com \
-       certbot/conf/archive/your-domain.com \
-       certbot/conf/renewal/your-domain.com.conf
-
-docker compose run --rm certbot certonly \
-  --webroot --webroot-path=/var/www/certbot \
-  --email your-email@example.com \
-  --agree-tos --no-eff-email \
-  -d your-domain.com
-```
+返回 `200` 或 `404` 说明请求被反向代理当成普通 HTTP 处理了，
+即升级头没有透传；返回 `502` 说明代理连不上容器。
 
 ## 系统要求
 
@@ -338,8 +348,7 @@ docker compose run --rm certbot certonly \
 - tokio-tungstenite：WebSocket 实现
 - serde / serde_json：消息序列化
 - sha2：大厅 ID 哈希
-- Docker + Docker Compose：容器化部署
-- Nginx + Let's Encrypt：反向代理与证书（可选）
+- Docker + Docker Compose：容器化部署（反向代理与证书由部署者自行处理）
 
 ## 开源协议
 
