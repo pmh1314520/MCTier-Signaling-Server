@@ -33,6 +33,11 @@ struct Pool {
     counts: Mutex<(usize, HashMap<IpAddr, usize>)>,
 }
 
+/// Handshakes are short-lived, but one source must not consume the complete
+/// pre-authentication pool. This limit is independent of the optional active
+/// per-source quota.
+const DEFAULT_PENDING_SOURCE_LIMIT: usize = 16;
+
 pub struct Lease {
     pool: Arc<Pool>,
     source: Option<IpAddr>,
@@ -77,6 +82,41 @@ impl Drop for Lease {
     }
 }
 
+impl Lease {
+    /// Re-classify a proxied handshake once its forwarded client is known.
+    ///
+    /// A proxy TCP peer cannot be attributed to an end user until HTTP headers
+    /// are available. Keep the same pool slot, but atomically move its
+    /// per-source accounting to the forwarded identity.
+    pub fn resolve_source(&mut self, source: IpAddr) -> Result<(), &'static str> {
+        let source = quota_source(source);
+        let mut counts = self.pool.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if self.source == Some(source) {
+            return Ok(());
+        }
+
+        let limit = self
+            .pool
+            .source_limit
+            .ok_or("source connection capacity reached")?;
+        if counts.1.get(&source).copied().unwrap_or(0) >= limit {
+            return Err("source connection capacity reached");
+        }
+        *counts.1.entry(source).or_default() += 1;
+
+        if let Some(previous) = self.source.take() {
+            if let Some(count) = counts.1.get_mut(&previous) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.1.remove(&previous);
+                }
+            }
+        }
+        self.source = Some(source);
+        Ok(())
+    }
+}
+
 impl Admission {
     pub fn new(max: usize, per_source: Option<usize>, proxies: &str) -> Result<Self, String> {
         let trusted_proxies = proxies
@@ -99,8 +139,12 @@ impl Admission {
             trusted_proxies,
             // Handshakes cannot consume the established WebSocket pool.
             pending: pool(
-                max.min(128).max(1),
-                per_source.map(|limit| limit.min(16).max(1)),
+                max.clamp(1, 128),
+                Some(
+                    per_source
+                        .unwrap_or(DEFAULT_PENDING_SOURCE_LIMIT)
+                        .clamp(1, DEFAULT_PENDING_SOURCE_LIMIT),
+                ),
             ),
             active: pool(
                 max.max(1),
@@ -147,11 +191,27 @@ impl Admission {
             if chain.len() > 16 {
                 return Err("forwarded chain too long");
             }
-            return chain
+            let client = chain
                 .into_iter()
                 .rev()
                 .find(|ip| !self.trusted_proxies.contains(ip))
-                .ok_or("forwarded chain has no client address");
+                .ok_or("forwarded chain has no client address")?;
+            match headers.get_all("x-real-ip").iter().count() {
+                0 => {}
+                1 => {
+                    let real = headers["x-real-ip"]
+                        .to_str()
+                        .ok()
+                        .and_then(|value| value.parse::<IpAddr>().ok())
+                        .map(canonical)
+                        .ok_or("invalid real address")?;
+                    if !self.trusted_proxies.contains(&real) && real != client {
+                        return Err("conflicting forwarded address");
+                    }
+                }
+                _ => return Err("ambiguous forwarded address"),
+            }
+            return Ok(client);
         }
         if headers.get_all("x-real-ip").iter().count() != 1 {
             return Err("trusted proxy must send client address");
@@ -223,6 +283,28 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_chain_must_agree_with_a_client_x_real_ip_vouch() {
+        let guard = Admission::new(16, Some(4), "127.0.0.1,::1").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.23".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.7".parse().unwrap());
+        assert_eq!(
+            guard
+                .source("127.0.0.1".parse().unwrap(), &headers)
+                .unwrap_err(),
+            "conflicting forwarded address"
+        );
+        headers.insert("x-forwarded-for", "192.0.2.7".parse().unwrap());
+        assert_eq!(
+            guard
+                .source("127.0.0.1".parse().unwrap(), &headers)
+                .unwrap()
+                .to_string(),
+            "192.0.2.7"
+        );
+    }
+
+    #[test]
     fn disabled_source_limit_allows_one_source_up_to_global_limit() {
         let guard = Admission::new(4, None, "").unwrap();
         let ip = "192.0.2.1".parse().unwrap();
@@ -242,6 +324,22 @@ mod tests {
         ));
         drop(pending);
         assert!(guard.pending(ip).is_ok());
+    }
+
+    #[test]
+    fn proxy_handshakes_are_limited_by_forwarded_source() {
+        let guard = Admission::new(16, Some(1), "127.0.0.1").unwrap();
+        let proxy = "127.0.0.1".parse().unwrap();
+        let mut first = guard.pending(proxy).unwrap();
+        let mut second = guard.pending(proxy).unwrap();
+
+        first.resolve_source("192.0.2.1".parse().unwrap()).unwrap();
+        second.resolve_source("192.0.2.2".parse().unwrap()).unwrap();
+        let mut third = guard.pending(proxy).unwrap();
+        assert!(third.resolve_source("192.0.2.1".parse().unwrap()).is_err());
+        drop(first);
+        let mut fourth = guard.pending(proxy).unwrap();
+        assert!(fourth.resolve_source("192.0.2.1".parse().unwrap()).is_ok());
     }
 
     #[test]

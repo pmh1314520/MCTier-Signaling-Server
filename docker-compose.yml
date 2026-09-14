@@ -10,10 +10,10 @@
       dockerfile: Dockerfile
     container_name: mctier-signaling
     restart: unless-stopped
-    # 端口映射：直接暴露 8445 端口
+    # 端口映射：默认仅绑定本机回环地址
     # 部署者需自行配置反向代理（nginx/caddy）和 TLS 证书
     ports:
-      - "8445:8445"
+      - "127.0.0.1:8445:8445"
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - BIND_ADDRESS=0.0.0.0:8445
@@ -24,6 +24,7 @@
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - COMMUNITY_NODES_FILE=/app/data/community_nodes.json
       - COMMUNITY_NODE_CAPACITY=${COMMUNITY_NODE_CAPACITY:-200}
+      - COMMUNITY_NODE_ALLOW_PRIVATE_TARGETS=${COMMUNITY_NODE_ALLOW_PRIVATE_TARGETS:-false}
     # 用户投稿的共享节点存档：用命名卷持久化，容器重建后投稿不丢失
     volumes:
       - mctier-signaling-data:/app/data
