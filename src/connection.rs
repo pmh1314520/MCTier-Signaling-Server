@@ -577,7 +577,7 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     let chat_public_key =
                                         normalize_chat_public_key(chat_public_key);
 
-                                    log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?} - 聊天公钥: {}", 
+                                    log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?} - 聊天公钥: {}",
                                         player_name, cid, lobby_name, client_version, virtual_ip, virtual_domain, use_domain,
                                         if chat_public_key.is_some() { "已提交" } else { "未提交" });
 
