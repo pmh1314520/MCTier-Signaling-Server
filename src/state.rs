@@ -182,17 +182,33 @@ impl RegisterPasswordFailures {
         });
     }
 
-    /// 返回 true 表示该 (来源, 大厅) 已锁定或进入保护表，必须拒绝本次尝试。
+    /// Only failures for this source and lobby may lock its registration.
     pub(crate) fn is_locked(&mut self, key: &(IpAddr, String), now: Instant) -> bool {
         self.prune(now);
         match self.attempts.get(key) {
             Some(attempts) => attempts.len() >= MAX_REGISTER_PASSWORD_FAILURES,
-            None => self.attempts.len() >= MAX_REGISTER_PASSWORD_KEYS,
+            None => false,
         }
     }
 
     pub(crate) fn record_failure(&mut self, key: &(IpAddr, String), now: Instant) {
-        self.attempts.entry(key.clone()).or_default().push_back(now);
+        self.prune(now);
+        if !self.attempts.contains_key(key) && self.attempts.len() >= MAX_REGISTER_PASSWORD_KEYS {
+            // Bound memory by retiring the least recently failed key, never by
+            // denying registration to unrelated users when the table is full.
+            let oldest = self
+                .attempts
+                .iter()
+                .min_by_key(|(_, attempts)| attempts.back().copied())
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.attempts.remove(&oldest);
+            }
+        }
+        let attempts = self.attempts.entry(key.clone()).or_default();
+        if attempts.len() < MAX_REGISTER_PASSWORD_FAILURES {
+            attempts.push_back(now);
+        }
     }
 
     pub(crate) fn clear(&mut self, key: &(IpAddr, String)) {
@@ -214,4 +230,31 @@ pub(crate) fn rotate_chat_token(lobby: &mut LobbyInfo) -> (String, u64) {
     lobby.chat_token = generate_chat_token();
     lobby.chat_token_epoch = lobby.chat_token_epoch.saturating_add(1).max(1);
     (lobby.chat_token.clone(), lobby.chat_token_epoch)
+}
+
+#[cfg(test)]
+mod password_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn full_failure_table_does_not_lock_unrelated_users_and_stays_bounded() {
+        let now = Instant::now();
+        let mut failures = RegisterPasswordFailures {
+            attempts: HashMap::new(),
+        };
+        let attacker = "192.0.2.1".parse().unwrap();
+        for index in 0..MAX_REGISTER_PASSWORD_KEYS {
+            failures.record_failure(&(attacker, format!("room-{index}")), now);
+        }
+        let innocent = ("192.0.2.2".parse().unwrap(), "new-room".to_string());
+        assert!(!failures.is_locked(&innocent, now));
+        failures.record_failure(&innocent, now);
+        assert!(failures.attempts.len() <= MAX_REGISTER_PASSWORD_KEYS);
+        for _ in 1..MAX_REGISTER_PASSWORD_FAILURES {
+            failures.record_failure(&innocent, now);
+        }
+        assert!(failures.is_locked(&innocent, now));
+        let stranger = ("192.0.2.3".parse().unwrap(), "another-room".to_string());
+        assert!(!failures.is_locked(&stranger, now));
+    }
 }
