@@ -45,3 +45,13 @@ community_nodes.json.tmp
 # 临时文件
 *.tmp
 *.bak
+
+# Local source exports and compiled packages are not repository inputs.
+/*.zip
+/*.7z
+/*.rar
+*.exe
+*.dll
+*.partial
+*.jks
+*.keystore
