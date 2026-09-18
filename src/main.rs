@@ -1472,6 +1472,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn address_conflicts_recover_without_displacing_existing_members() {
+        for password in ["", "Password12"] {
+            let (address, server) = spawn_test_server().await;
+            let url = format!("ws://{address}");
+            let (mut host, _) = connect_async(&url).await.unwrap();
+            send_register_with_ip(
+                &mut host,
+                "desktop-host",
+                "auto-room",
+                password,
+                "10.126.126.1",
+            )
+            .await;
+            assert_eq!(next_json(&mut host).await["type"], "register-success");
+            assert_eq!(next_json(&mut host).await["type"], "players-list");
+
+            let mut members = Vec::new();
+            for (label, occupied, available) in [
+                ("desktop-member", "10.126.126.1", "10.126.126.2"),
+                ("android-member", "10.126.126.2", "10.126.126.3"),
+            ] {
+                let (mut rejected, _) = connect_async(&url).await.unwrap();
+                send_register_with_ip(&mut rejected, label, "auto-room", password, occupied).await;
+                let error = next_json(&mut rejected).await;
+                assert_eq!(error["type"], "register-error");
+                assert_eq!(error["message"], "virtualIp 已被大厅内其他成员使用");
+                rejected.close(None).await.unwrap();
+
+                let (mut retry, _) = connect_async(&url).await.unwrap();
+                send_register_with_ip(&mut retry, label, "auto-room", password, available).await;
+                let success = next_json(&mut retry).await;
+                assert_eq!(success["type"], "register-success");
+                assert_eq!(success["clientId"], test_client_id(label));
+                assert_eq!(success["hostId"], test_client_id("desktop-host"));
+                let roster = next_json(&mut retry).await;
+                assert_eq!(roster["type"], "players-list");
+                let ips: std::collections::HashSet<_> = roster["players"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|player| player["virtualIp"].as_str().unwrap())
+                    .collect();
+                assert_eq!(ips.len(), roster["players"].as_array().unwrap().len());
+                assert!(ips.contains("10.126.126.1"));
+                members.push(retry);
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn same_client_id_reconnect_replaces_existing_session() {
         let (address, server) = spawn_test_server().await;
         let url = format!("ws://{address}");
