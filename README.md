@@ -82,7 +82,7 @@ docker compose logs -f
 | --- | --- | --- |
 | `BIND_ADDRESS` | `0.0.0.0:8445` | 监听地址和端口 |
 | `RUST_LOG` | `info` | 日志级别：`error`/`warn`/`info`/`debug`/`trace` |
-| `MINIMUM_CLIENT_VERSION` | `3.0.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
+| `MINIMUM_CLIENT_VERSION` | `3.8.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
 | `CLIENT_DOWNLOAD_URL` | MCTier 官网 | 版本过低时提示给客户端的下载地址 |
 | `MAX_CONNECTIONS` | `4096` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
 | `MAX_CONNECTIONS_PER_SOURCE` | 未设置（不启用） | 可选的每个真实来源并发上限；只有显式设置正整数（例如 `128`）才启用。同一 NAT 下的用户会共享该额度 |
@@ -399,3 +399,5 @@ curl -i -N \
 - QQ 交流群：1075096452
 - GitHub：https://github.com/pmh1314520/MCTier
 - Gitee：https://gitee.com/peng-minghang/mctier
+
+最低版本默认值现为 `3.8.0`。已有部署若在 `.env` 或云端环境变量中设置了 `MINIMUM_CLIENT_VERSION`，请同步设为 `3.8.0` 并重新创建容器；仅更新源码不会覆盖已有环境变量。

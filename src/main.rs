@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod connection_guard;
 
 /// 默认要求的最低客户端版本（可通过环境变量 MINIMUM_CLIENT_VERSION 覆盖）
-const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "3.0.0";
+const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "3.8.0";
 
 /// 默认监听地址（可通过环境变量 BIND_ADDRESS 覆盖）
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8445";
@@ -344,14 +344,14 @@ mod tests {
         assert!(!is_version_valid("2.1.0.1", "2.1.0"));
     }
 
-    /// 门槛提到 3.0.0 后，2.x 客户端必须被拒、3.0.0 及以上必须放行。
+    /// 门槛提到 3.8.0 后，旧客户端必须被拒、3.8.0 及以上必须放行。
     /// 这条固定住「最低版本要求」这个产品决策本身，而不只是比较函数的行为。
     #[test]
-    fn minimum_client_version_blocks_pre_3_clients() {
-        assert_eq!(DEFAULT_MINIMUM_CLIENT_VERSION, "3.0.0");
+    fn minimum_client_version_blocks_pre_3_8_clients() {
+        assert_eq!(DEFAULT_MINIMUM_CLIENT_VERSION, "3.8.0");
 
         // 低于门槛：一律拒绝
-        for old in ["1.0.0", "2.0.0", "2.1.0", "2.7.5", "2.8.0", "2.9.9"] {
+        for old in ["1.0.0", "2.9.9", "3.0.0", "3.7.0", "3.7.99"] {
             assert!(
                 !is_version_valid(old, DEFAULT_MINIMUM_CLIENT_VERSION),
                 "client {old} must be rejected"
@@ -359,7 +359,7 @@ mod tests {
         }
 
         // 达到或高于门槛：放行
-        for ok in ["3.0.0", "3.0.1", "3.1.0", "4.0.0"] {
+        for ok in ["3.8.0", "3.8.1", "3.9.0", "4.0.0"] {
             assert!(
                 is_version_valid(ok, DEFAULT_MINIMUM_CLIENT_VERSION),
                 "client {ok} must be allowed"
@@ -560,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_register_old_versions_receive_upgrade_error_and_disconnect() {
-        for version in [Some("2.7.5"), Some("2.9.99"), None] {
+        for version in [Some("2.7.5"), Some("3.7.99"), None] {
             let (address, server_task) =
                 start_connection_server(tokio::time::Duration::from_secs(1)).await;
             let (mut client, _) = connect_async(format!("ws://{address}"))
@@ -582,7 +582,7 @@ mod tests {
             let error = next_json(&mut client).await;
             assert_eq!(error["type"], "version-too-old");
             assert_eq!(error["currentVersion"], version.unwrap_or("unknown"));
-            assert_eq!(error["minimumVersion"], "3.0.0");
+            assert_eq!(error["minimumVersion"], "3.8.0");
             assert_eq!(error["downloadUrl"], client_download_url());
             match timeout(Duration::from_secs(1), client.next())
                 .await
@@ -1124,6 +1124,63 @@ mod tests {
         let message: SignalingMessage = serde_json::from_str(raw).unwrap();
 
         assert_eq!(message.claimed_sender(raw).as_deref(), Some("host-id"));
+    }
+
+    #[tokio::test]
+    async fn promoted_host_is_unmuted_for_manual_transfer_and_host_disconnect() {
+        for disconnect in [false, true] {
+            let (address, server) = spawn_test_server().await;
+            let url = format!("ws://{address}");
+            let (mut host, _) = connect_async(&url).await.unwrap();
+            register(&mut host, "moderation-host", "moderation-room").await;
+            let host_id = test_client_id("moderation-host");
+            let (mut member, _) = connect_async(&url).await.unwrap();
+            register(&mut member, "moderation-member", "moderation-room").await;
+            let member_id = test_client_id("moderation-member");
+            assert_eq!(next_json(&mut host).await["type"], "chat-token-rotated");
+            assert_eq!(next_json(&mut host).await["type"], "player-joined");
+            host.send(Message::Text(serde_json::json!({
+                "type": "mute-player", "from": host_id, "target": member_id, "muted": true
+            }).to_string())).await.unwrap();
+            for socket in [&mut host, &mut member] {
+                let event = next_json(socket).await;
+                assert_eq!(event["type"], "player-mute-changed");
+                assert_eq!(event["muted"], true);
+                assert_eq!(event["playerId"], member_id);
+            }
+            if disconnect {
+                host.close(None).await.unwrap();
+            } else {
+                host.send(Message::Text(serde_json::json!({
+                    "type": "transfer-host", "from": host_id, "target": member_id
+                }).to_string())).await.unwrap();
+            }
+            let mut unmuted = false;
+            loop {
+                let event = next_json(&mut member).await;
+                if event["type"] == "player-mute-changed" {
+                    assert_eq!(event["muted"], false);
+                    assert_eq!(event["playerId"], member_id);
+                    unmuted = true;
+                }
+                if event["type"] == "host-changed" {
+                    assert_eq!(event["hostId"], member_id);
+                    break;
+                }
+            }
+            assert!(unmuted, "old clients must receive the explicit unmute");
+            // A host cannot mute themselves through a forged/manual management request.
+            member.send(Message::Text(serde_json::json!({
+                "type": "mute-player", "from": member_id, "target": member_id, "muted": true
+            }).to_string())).await.unwrap();
+            member.send(Message::Text(serde_json::json!({"type": "ping"}).to_string())).await.unwrap();
+            assert_eq!(next_json(&mut member).await["type"], "pong");
+            let (mut newcomer, _) = connect_async(&url).await.unwrap();
+            let snapshot = register(&mut newcomer, "moderation-newcomer", "moderation-room").await;
+            assert_eq!(snapshot["hostId"], member_id);
+            assert_eq!(snapshot["mutedPlayers"], serde_json::json!([]));
+            server.abort();
+        }
     }
 
     #[test]

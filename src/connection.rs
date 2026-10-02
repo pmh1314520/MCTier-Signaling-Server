@@ -2373,6 +2373,9 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                                 log::warn!("🚫 非房主尝试禁言: {}", from);
                                                 continue;
                                             }
+                                            if target == lobby.host_id && muted {
+                                                continue;
+                                            }
                                             if !lobby.clients.contains_key(&target) {
                                                 log::warn!(
                                                     "🚫 房主尝试禁言不在大厅内的成员: {}",
@@ -2425,12 +2428,16 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                             }
                                             if lobby.clients.contains_key(&target) {
                                                 lobby.host_id = target.clone();
+                                                lobby.muted.remove(&target);
                                                 new_host = Some(target.clone());
                                             }
                                         }
                                     }
                                     if let Some(host_id) = new_host {
                                         log::info!("👑 房主从 {} 转让给 {}", from, host_id);
+                                        broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
+                                            player_id: host_id.clone(), muted: false,
+                                        }).await;
                                         broadcast_to_lobby(
                                             &lobbies,
                                             &lid,
@@ -2587,6 +2594,7 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                     if lobby.host_id == cid {
                         if let Some(next) = lobby.clients.keys().next().cloned() {
                             lobby.host_id = next.clone();
+                            lobby.muted.remove(&next);
                             new_host = Some(next);
                             log::info!("👑 房主离开，自动转移给 {}", lobby.host_id);
                         }
@@ -2634,6 +2642,9 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
 
         // 若房主已自动转移，广播房主变更
         if let Some(host_id) = new_host {
+            broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
+                player_id: host_id.clone(), muted: false,
+            }).await;
             broadcast_to_lobby(
                 &lobbies,
                 &lid,
