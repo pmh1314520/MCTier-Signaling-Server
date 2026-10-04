@@ -637,14 +637,23 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     let mut lobbies_write = lobbies.write().await;
                                     // Check under the same write lock as insertion: two creators
                                     // cannot both claim a name. Do this before password checks.
-                                    let entry_error = match (entry_mode, lobbies_write.contains_key(&lid)) {
-                                        (Some(LobbyEntryMode::Create), true) => Some("大厅名称已被占用，请更换大厅名称后重试"),
-                                        (Some(LobbyEntryMode::Join), false) => Some("大厅不存在或已关闭，请检查大厅名称或联系房主"),
-                                        _ => None, // Legacy clients and explicit automatic entry.
-                                    };
+                                    let entry_error =
+                                        match (entry_mode, lobbies_write.contains_key(&lid)) {
+                                            (Some(LobbyEntryMode::Create), true) => {
+                                                Some("大厅名称已被占用，请更换大厅名称后重试")
+                                            }
+                                            (Some(LobbyEntryMode::Join), false) => {
+                                                Some("大厅不存在或已关闭，请检查大厅名称或联系房主")
+                                            }
+                                            _ => None, // Legacy clients and explicit automatic entry.
+                                        };
                                     if let Some(message) = entry_error {
                                         drop(lobbies_write);
-                                        if let Ok(json) = serde_json::to_string(&SignalingMessage::RegisterError { message: message.into() }) {
+                                        if let Ok(json) = serde_json::to_string(
+                                            &SignalingMessage::RegisterError {
+                                                message: message.into(),
+                                            },
+                                        ) {
                                             send_text(&write, json).await;
                                         }
                                         break;
@@ -2451,9 +2460,16 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     }
                                     if let Some(host_id) = new_host {
                                         log::info!("👑 房主从 {} 转让给 {}", from, host_id);
-                                        broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
-                                            player_id: host_id.clone(), muted: false,
-                                        }).await;
+                                        broadcast_to_lobby(
+                                            &lobbies,
+                                            &lid,
+                                            "",
+                                            SignalingMessage::PlayerMuteChanged {
+                                                player_id: host_id.clone(),
+                                                muted: false,
+                                            },
+                                        )
+                                        .await;
                                         broadcast_to_lobby(
                                             &lobbies,
                                             &lid,
@@ -2658,9 +2674,16 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
 
         // 若房主已自动转移，广播房主变更
         if let Some(host_id) = new_host {
-            broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
-                player_id: host_id.clone(), muted: false,
-            }).await;
+            broadcast_to_lobby(
+                &lobbies,
+                &lid,
+                "",
+                SignalingMessage::PlayerMuteChanged {
+                    player_id: host_id.clone(),
+                    muted: false,
+                },
+            )
+            .await;
             broadcast_to_lobby(
                 &lobbies,
                 &lid,

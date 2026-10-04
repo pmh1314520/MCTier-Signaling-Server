@@ -10,7 +10,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc,
 };
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
@@ -18,121 +18,6 @@ use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 mod connection_guard;
-
-/// 默认要求的最低客户端版本（可通过环境变量 MINIMUM_CLIENT_VERSION 覆盖）
-const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "3.8.0";
-
-/// 默认监听地址（可通过环境变量 BIND_ADDRESS 覆盖）
-const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8445";
-
-/// 握手阶段允许客户端占用连接的最长时间
-const WEBSOCKET_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
-
-/// 首次注册消息的绝对截止时间
-const REGISTRATION_TIMEOUT_SECS: u64 = 15;
-
-/// 单次发送允许等待的最长时间
-const SEND_TIMEOUT_SECS: u64 = 5;
-
-/// 单条 WebSocket 消息的最大大小
-const MAX_MESSAGE_SIZE: usize = 512 * 1024;
-
-/// 单个 WebSocket 帧的最大大小
-const MAX_FRAME_SIZE: usize = 256 * 1024;
-
-const MAX_LOBBY_MEMBERS: usize = 64;
-const MAX_CLIENT_ID_LEN: usize = 128;
-const MAX_PLAYER_NAME_LEN: usize = 128;
-const MAX_LOBBY_NAME_LEN: usize = 128;
-const MAX_LOBBY_PASSWORD_LEN: usize = 256;
-const MAX_VIRTUAL_DOMAIN_LEN: usize = 253;
-const MAX_CLIENT_VERSION_LEN: usize = 32;
-const SIGNALING_PROTOCOL_VERSION: u32 = 3;
-const CHALLENGE_BYTES: usize = 32;
-const MAX_IDENTITY_PUBLIC_KEY_LEN: usize = 512;
-const MAX_IDENTITY_SIGNATURE_LEN: usize = 256;
-const MAX_SDP_LEN: usize = 128 * 1024;
-const MAX_ICE_CANDIDATE_LEN: usize = 16 * 1024;
-const MAX_CONTROL_TEXT_LEN: usize = 8 * 1024;
-const MAX_MESSAGES_PER_WINDOW: u32 = 120;
-const MESSAGE_RATE_WINDOW_SECS: u64 = 10;
-const MAX_OUTBOUND_FRAMES_PER_WINDOW: u32 = 64;
-const MAX_OUTBOUND_BYTES_PER_WINDOW: usize = 1024 * 1024;
-const OUTBOUND_BUDGET_WINDOW_SECS: u64 = 1;
-const COMMUNITY_NODE_SUBMIT_MAX_PER_WINDOW: u32 = 8;
-const COMMUNITY_NODE_SUBMIT_WINDOW_SECS: u64 = 10 * 60;
-const MAX_TRACKED_IP_SUBMITTERS: usize = 8192;
-const COMMUNITY_NODE_PROBE_QUEUE_TIMEOUT_SECS: u64 = 1;
-const MAX_REMOTE_SESSION_ID_LEN: usize = 128;
-const MAX_SHARE_ID_LEN: usize = 128;
-const MAX_SHARE_NAME_LEN: usize = 256;
-const MAX_ERROR_TEXT_LEN: usize = 512;
-
-/// 聊天签名公钥（X.509 SubjectPublicKeyInfo DER 的 base64）长度上限。
-/// 未压缩 P-256 公钥 DER 为 91 字节，base64 后约 124 字符，留出余量后仍能
-/// 拦住任何异常大的值；注册时还会在 P-256 解析阶段验证其密码学有效性。
-const MAX_CHAT_PUBLIC_KEY_LEN: usize = 512;
-
-/// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
-const DEFAULT_MAX_CONNECTIONS: usize = 4096;
-
-/// 已注册连接的空闲超时。
-///
-/// 客户端（桌面端与 Android 端）均以 15 秒周期发送应用层 {"type":"ping"}，
-/// 因此正常连接不会触发该超时。半开连接（休眠 / 切换网络 / NAT 表超时，
-/// 对端未发出 FIN）会一直停在 read.next() 上，若不回收则该 clientId 的
-/// 会话永久留在大厅里；由于重复 clientId 会被拒绝注册，该玩家将无法重连。
-const REGISTERED_IDLE_TIMEOUT_SECS: u64 = 60;
-
-/// 版本过低时提示客户端的下载地址（可通过环境变量 CLIENT_DOWNLOAD_URL 覆盖）
-const DEFAULT_CLIENT_DOWNLOAD_URL: &str = "https://mctier.pmhs.top";
-
-/// 读取环境变量，并过滤掉空值
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// 客户端下载地址（进程内只解析一次）
-fn client_download_url() -> &'static str {
-    static CELL: OnceLock<String> = OnceLock::new();
-    CELL.get_or_init(|| env_or("CLIENT_DOWNLOAD_URL", DEFAULT_CLIENT_DOWNLOAD_URL))
-}
-
-/// 服务器要求的最低客户端版本（进程内只解析一次）
-fn minimum_client_version() -> &'static str {
-    static CELL: OnceLock<String> = OnceLock::new();
-    CELL.get_or_init(|| env_or("MINIMUM_CLIENT_VERSION", DEFAULT_MINIMUM_CLIENT_VERSION))
-}
-
-/// 投稿节点注册表容量上限（进程内只解析一次）
-fn community_node_capacity() -> usize {
-    static CELL: OnceLock<usize> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("COMMUNITY_NODE_CAPACITY")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_COMMUNITY_NODE_CAPACITY)
-    })
-}
-
-/// 投稿节点持久化文件路径（进程内只解析一次）
-fn community_nodes_file() -> &'static str {
-    static CELL: OnceLock<String> = OnceLock::new();
-    CELL.get_or_init(|| env_or("COMMUNITY_NODES_FILE", DEFAULT_COMMUNITY_NODES_FILE))
-}
-
-/// 当前 Unix 时间戳（秒）
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 mod protocol;
 use protocol::*;
@@ -157,8 +42,8 @@ async fn main() {
     // 初始化日志
     env_logger::init();
 
-    // 监听地址：默认 0.0.0.0:8445，可用环境变量 BIND_ADDRESS 覆盖
-    let listen_addr = env_or("BIND_ADDRESS", DEFAULT_BIND_ADDRESS);
+    let config = config::initialize(ServerConfig::from_env());
+    let listen_addr = config.bind_address.clone();
 
     log::info!("MCTier WebSocket 信令服务器");
     log::info!(
@@ -166,9 +51,8 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
     log::info!("监听地址: {} (WebSocket Only)", listen_addr);
-    log::info!("最低客户端版本: {}", minimum_client_version());
-    let max_connections = max_connections();
-    log::info!("最大并发连接数: {}", max_connections);
+    log::info!("最低客户端版本: {}", config.minimum_client_version);
+    log::info!("最大并发连接数: {}", config.max_connections);
     let admission = connection_guard::admission();
     log::info!("Trusted reverse proxies: {:?}", admission.trusted_proxies);
     match admission.source_limit() {
@@ -190,10 +74,10 @@ async fn main() {
     let probe_limiter: ProbeLimiter = Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY));
     log::info!(
         "共享节点：容量上限 {}，巡检周期 {} 秒，失效超过 {} 秒自动移除，存档 {}",
-        community_node_capacity(),
+        config.community_node_capacity,
         COMMUNITY_NODE_PROBE_INTERVAL_SECS,
         COMMUNITY_NODE_MAX_OFFLINE_SECS,
-        community_nodes_file()
+        config.community_nodes_file
     );
     spawn_community_node_sweeper(Arc::clone(&community_nodes), Arc::clone(&probe_limiter)).await;
 
@@ -913,31 +797,65 @@ mod tests {
     #[tokio::test]
     async fn explicit_entry_modes_reject_duplicates_and_missing_lobbies_before_passwords() {
         let (address, server) = spawn_test_server().await;
-        async fn entry(address: SocketAddr, who: &str, room: &str, password: &str, mode: &str)
-            -> (WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, serde_json::Value) {
+        async fn entry(
+            address: SocketAddr,
+            who: &str,
+            room: &str,
+            password: &str,
+            mode: &str,
+        ) -> (
+            WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            serde_json::Value,
+        ) {
             let (mut socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
             let frame = next_frame(&mut socket).await.unwrap();
-            let challenge: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            let challenge: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
             assert_eq!(challenge["lobbyEntryModes"], true);
-            let original = register_message_for_challenge(who, room, password,
-                if who == "host" { "10.126.126.1" } else { "10.126.126.2" }, challenge["challenge"].as_str().unwrap());
-            let mut message: serde_json::Value = serde_json::from_str(original.to_text().unwrap()).unwrap();
+            let original = register_message_for_challenge(
+                who,
+                room,
+                password,
+                if who == "host" {
+                    "10.126.126.1"
+                } else {
+                    "10.126.126.2"
+                },
+                challenge["challenge"].as_str().unwrap(),
+            );
+            let mut message: serde_json::Value =
+                serde_json::from_str(original.to_text().unwrap()).unwrap();
             message["entryMode"] = mode.into();
-            socket.send(Message::Text(message.to_string())).await.unwrap();
+            socket
+                .send(Message::Text(message.to_string()))
+                .await
+                .unwrap();
             let reply = next_json(&mut socket).await;
             (socket, reply)
         }
         let (_, missing) = entry(address, "joiner", "entry-mode-room", "wrong", "join").await;
-        assert_eq!(missing["message"], "大厅不存在或已关闭，请检查大厅名称或联系房主");
-        let (mut host, created) = entry(address, "host", "entry-mode-room", "correct", "create").await;
-        assert_eq!(created["type"], "register-success", "failed join must not create a room");
+        assert_eq!(
+            missing["message"],
+            "大厅不存在或已关闭，请检查大厅名称或联系房主"
+        );
+        let (mut host, created) =
+            entry(address, "host", "entry-mode-room", "correct", "create").await;
+        assert_eq!(
+            created["type"], "register-success",
+            "failed join must not create a room"
+        );
         for password in ["wrong", "correct"] {
-            let (_, duplicate) = entry(address, "creator", "entry-mode-room", password, "create").await;
-            assert_eq!(duplicate["message"], "大厅名称已被占用，请更换大厅名称后重试");
+            let (_, duplicate) =
+                entry(address, "creator", "entry-mode-room", password, "create").await;
+            assert_eq!(
+                duplicate["message"],
+                "大厅名称已被占用，请更换大厅名称后重试"
+            );
         }
         let (_, wrong) = entry(address, "joiner", "entry-mode-room", "wrong", "join").await;
         assert_eq!(wrong["message"], "密码错误");
-        let (_joined, correct) = entry(address, "joiner", "entry-mode-room", "correct", "join").await;
+        let (_joined, correct) =
+            entry(address, "joiner", "entry-mode-room", "correct", "join").await;
         assert_eq!(correct["type"], "register-success");
 
         // Simultaneous claims must have exactly one winner, including passwordless rooms.
@@ -946,8 +864,20 @@ mod tests {
             entry(address, "racer-b", "entry-race-room", "", "create"),
         );
         let replies = [&first.1, &second.1];
-        assert_eq!(replies.iter().filter(|reply| reply["type"] == "register-success").count(), 1);
-        assert_eq!(replies.iter().filter(|reply| reply["message"] == "大厅名称已被占用，请更换大厅名称后重试").count(), 1);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply["type"] == "register-success")
+                .count(),
+            1
+        );
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply["message"] == "大厅名称已被占用，请更换大厅名称后重试")
+                .count(),
+            1
+        );
         host.close(None).await.unwrap();
         server.abort();
     }
@@ -1181,9 +1111,14 @@ mod tests {
             let member_id = test_client_id("moderation-member");
             assert_eq!(next_json(&mut host).await["type"], "chat-token-rotated");
             assert_eq!(next_json(&mut host).await["type"], "player-joined");
-            host.send(Message::Text(serde_json::json!({
-                "type": "mute-player", "from": host_id, "target": member_id, "muted": true
-            }).to_string())).await.unwrap();
+            host.send(Message::Text(
+                serde_json::json!({
+                    "type": "mute-player", "from": host_id, "target": member_id, "muted": true
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
             for socket in [&mut host, &mut member] {
                 let event = next_json(socket).await;
                 assert_eq!(event["type"], "player-mute-changed");
@@ -1193,9 +1128,14 @@ mod tests {
             if disconnect {
                 host.close(None).await.unwrap();
             } else {
-                host.send(Message::Text(serde_json::json!({
-                    "type": "transfer-host", "from": host_id, "target": member_id
-                }).to_string())).await.unwrap();
+                host.send(Message::Text(
+                    serde_json::json!({
+                        "type": "transfer-host", "from": host_id, "target": member_id
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
             }
             let mut unmuted = false;
             loop {
@@ -1212,10 +1152,21 @@ mod tests {
             }
             assert!(unmuted, "old clients must receive the explicit unmute");
             // A host cannot mute themselves through a forged/manual management request.
-            member.send(Message::Text(serde_json::json!({
-                "type": "mute-player", "from": member_id, "target": member_id, "muted": true
-            }).to_string())).await.unwrap();
-            member.send(Message::Text(serde_json::json!({"type": "ping"}).to_string())).await.unwrap();
+            member
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "mute-player", "from": member_id, "target": member_id, "muted": true
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            member
+                .send(Message::Text(
+                    serde_json::json!({"type": "ping"}).to_string(),
+                ))
+                .await
+                .unwrap();
             assert_eq!(next_json(&mut member).await["type"], "pong");
             let (mut newcomer, _) = connect_async(&url).await.unwrap();
             let snapshot = register(&mut newcomer, "moderation-newcomer", "moderation-room").await;
