@@ -37,7 +37,11 @@ mod community_nodes;
 use community_nodes::*;
 mod transport;
 use transport::*;
+mod registration;
+#[cfg(test)]
+use registration::is_version_valid;
 mod connection;
+mod moderation;
 use connection::*;
 
 #[tokio::main]
