@@ -340,6 +340,7 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
     let mut session_generation = 0u64;
     let challenge = random_hex::<CHALLENGE_BYTES>();
     let challenge_message = SignalingMessage::ServerChallenge {
+        lobby_entry_modes: true,
         challenge: challenge.clone(),
         protocol_version: SIGNALING_PROTOCOL_VERSION,
     };
@@ -478,6 +479,7 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     break;
                                 }
                                 SignalingMessage::RegisterV3 {
+                                    entry_mode,
                                     protocol_version,
                                     identity_public_key,
                                     challenge_signature,
@@ -633,6 +635,20 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     let lid = generate_lobby_id(&lobby_name);
 
                                     let mut lobbies_write = lobbies.write().await;
+                                    // Check under the same write lock as insertion: two creators
+                                    // cannot both claim a name. Do this before password checks.
+                                    let entry_error = match (entry_mode, lobbies_write.contains_key(&lid)) {
+                                        (Some(LobbyEntryMode::Create), true) => Some("大厅名称已被占用，请更换大厅名称后重试"),
+                                        (Some(LobbyEntryMode::Join), false) => Some("大厅不存在或已关闭，请检查大厅名称或联系房主"),
+                                        _ => None, // Legacy clients and explicit automatic entry.
+                                    };
+                                    if let Some(message) = entry_error {
+                                        drop(lobbies_write);
+                                        if let Ok(json) = serde_json::to_string(&SignalingMessage::RegisterError { message: message.into() }) {
+                                            send_text(&write, json).await;
+                                        }
+                                        break;
+                                    }
                                     let existing_client_lobby = lobbies_write.iter().find_map(
                                         |(existing_lid, existing_lobby)| {
                                             existing_lobby

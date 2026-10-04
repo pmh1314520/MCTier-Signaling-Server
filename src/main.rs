@@ -910,6 +910,48 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn explicit_entry_modes_reject_duplicates_and_missing_lobbies_before_passwords() {
+        let (address, server) = spawn_test_server().await;
+        async fn entry(address: SocketAddr, who: &str, room: &str, password: &str, mode: &str)
+            -> (WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, serde_json::Value) {
+            let (mut socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+            let frame = next_frame(&mut socket).await.unwrap();
+            let challenge: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(challenge["lobbyEntryModes"], true);
+            let original = register_message_for_challenge(who, room, password,
+                if who == "host" { "10.126.126.1" } else { "10.126.126.2" }, challenge["challenge"].as_str().unwrap());
+            let mut message: serde_json::Value = serde_json::from_str(original.to_text().unwrap()).unwrap();
+            message["entryMode"] = mode.into();
+            socket.send(Message::Text(message.to_string())).await.unwrap();
+            let reply = next_json(&mut socket).await;
+            (socket, reply)
+        }
+        let (_, missing) = entry(address, "joiner", "entry-mode-room", "wrong", "join").await;
+        assert_eq!(missing["message"], "大厅不存在或已关闭，请检查大厅名称或联系房主");
+        let (mut host, created) = entry(address, "host", "entry-mode-room", "correct", "create").await;
+        assert_eq!(created["type"], "register-success", "failed join must not create a room");
+        for password in ["wrong", "correct"] {
+            let (_, duplicate) = entry(address, "creator", "entry-mode-room", password, "create").await;
+            assert_eq!(duplicate["message"], "大厅名称已被占用，请更换大厅名称后重试");
+        }
+        let (_, wrong) = entry(address, "joiner", "entry-mode-room", "wrong", "join").await;
+        assert_eq!(wrong["message"], "密码错误");
+        let (_joined, correct) = entry(address, "joiner", "entry-mode-room", "correct", "join").await;
+        assert_eq!(correct["type"], "register-success");
+
+        // Simultaneous claims must have exactly one winner, including passwordless rooms.
+        let (first, second) = tokio::join!(
+            entry(address, "racer-a", "entry-race-room", "", "create"),
+            entry(address, "racer-b", "entry-race-room", "", "create"),
+        );
+        let replies = [&first.1, &second.1];
+        assert_eq!(replies.iter().filter(|reply| reply["type"] == "register-success").count(), 1);
+        assert_eq!(replies.iter().filter(|reply| reply["message"] == "大厅名称已被占用，请更换大厅名称后重试").count(), 1);
+        host.close(None).await.unwrap();
+        server.abort();
+    }
+
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         spawn_test_server_with_idle_timeout(tokio::time::Duration::from_secs(
             REGISTERED_IDLE_TIMEOUT_SECS,

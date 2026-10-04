@@ -1,6 +1,10 @@
 //! Wire protocol: message schema, bounded payload validation, and roster types.
 use super::*;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LobbyEntryMode { Create, Join, Auto }
+
 /// WebSocket 信令消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -8,6 +12,8 @@ pub enum SignalingMessage {
     /// 服务端在连接建立后立即下发的一次性注册挑战。
     ServerChallenge {
         challenge: String,
+        #[serde(rename = "lobbyEntryModes", default)]
+        lobby_entry_modes: bool,
         #[serde(rename = "protocolVersion")]
         protocol_version: u32,
     },
@@ -15,6 +21,8 @@ pub enum SignalingMessage {
     /// 不能再自行选择 clientId。
     #[serde(rename = "register-v3")]
     RegisterV3 {
+        #[serde(rename = "entryMode", default)]
+        entry_mode: Option<LobbyEntryMode>,
         #[serde(rename = "protocolVersion")]
         protocol_version: u32,
         #[serde(rename = "identityPublicKey")]
