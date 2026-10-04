@@ -1,12 +1,13 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use futures_util::{future::join_all, SinkExt, StreamExt};
+#[cfg(test)]
+use futures_util::SinkExt;
+use futures_util::{future::join_all, StreamExt};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -34,6 +35,8 @@ use config::*;
 
 mod community_nodes;
 use community_nodes::*;
+mod transport;
+use transport::*;
 mod connection;
 use connection::*;
 

@@ -218,7 +218,8 @@ wss://mctiers.pmhs.top
 
 ## 本地开发
 
-需要 Rust 1.83 或更高版本。
+需要 Rust 1.85 或更高版本。CI 与 Docker 构建固定使用 Rust 1.85.0；
+锁定依赖 `zeroize 1.9.0` 和 `base64ct 1.8.3` 的最低 Rust 版本为 1.85。
 
 ```bash
 # 检查编译

@@ -1,8 +1,8 @@
 # MCTier 信令服务器 Docker 镜像
 # 基于 Rust 官方镜像构建
 
-# 构建阶段 - 使用 Rust 1.85 或更高版本以支持 edition2024 依赖
-FROM rust:1.85-slim as builder
+# 构建阶段 - 与 CI 使用同一固定工具链，满足锁定依赖的 Rust 1.85 最低要求
+FROM rust:1.85.0-slim as builder
 
 # 安装必要的构建工具
 RUN apt-get update && apt-get install -y \
@@ -20,7 +20,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # 构建发布版本
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # 运行阶段
 FROM debian:bookworm-slim
