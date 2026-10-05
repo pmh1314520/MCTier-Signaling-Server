@@ -1,192 +1,9 @@
 //! WebSocket connection lifecycle, authenticated routing, and lobby state transitions.
 use super::*;
+use crate::moderation::{ModerationDispatch, ModerationSession};
+use crate::registration::{RegistrationContext, RegistrationOutcome, RegistrationRequest};
 #[cfg(not(test))]
-use crate::{protocol::*, security::*, state::*};
-
-pub(crate) async fn send_with_timeout<F, E>(send: F) -> bool
-where
-    F: Future<Output = Result<(), E>>,
-    E: std::fmt::Display,
-{
-    match tokio::time::timeout(tokio::time::Duration::from_secs(SEND_TIMEOUT_SECS), send).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            log::debug!("发送 WebSocket 消息失败: {}", error);
-            false
-        }
-        Err(_) => {
-            log::warn!("发送 WebSocket 消息超时（{} 秒）", SEND_TIMEOUT_SECS);
-            false
-        }
-    }
-}
-
-pub(crate) async fn send_message(sender: &ClientSender, message: Message) -> bool {
-    let message_bytes = match &message {
-        Message::Text(text) => text.len(),
-        Message::Binary(bytes) => bytes.len(),
-        Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
-        Message::Close(_) => 0,
-        Message::Frame(_) => 0,
-    };
-    {
-        let mut budget = sender.budget.lock().await;
-        if !budget.allow(message_bytes) {
-            log::warn!(
-                "丢弃超出出站预算的消息: bytes={}, frames_limit={}, bytes_limit={}",
-                message_bytes,
-                MAX_OUTBOUND_FRAMES_PER_WINDOW,
-                MAX_OUTBOUND_BYTES_PER_WINDOW
-            );
-            return false;
-        }
-    }
-    send_with_timeout(async {
-        let mut sink = sender.sink.write().await;
-        sink.send(message).await
-    })
-    .await
-}
-
-pub(crate) async fn send_text(sender: &ClientSender, text: String) -> bool {
-    send_message(sender, Message::Text(text)).await
-}
-
-pub(crate) fn json_sender_id(raw: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-    value
-        .get("from")
-        .or_else(|| value.get("clientId"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
-pub(crate) fn inject_session_metadata(raw: String, sender_id: &str, generation: u64) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return raw;
-    };
-    let Some(object) = value.as_object_mut() else {
-        return raw;
-    };
-    if object.contains_key("from") {
-        object.insert(
-            "from".to_string(),
-            serde_json::Value::String(sender_id.to_string()),
-        );
-    }
-    if object.contains_key("clientId") {
-        object.insert(
-            "clientId".to_string(),
-            serde_json::Value::String(sender_id.to_string()),
-        );
-    }
-    object.insert(
-        "sessionGeneration".to_string(),
-        serde_json::Value::from(generation),
-    );
-    serde_json::to_string(&value).unwrap_or(raw)
-}
-
-pub(crate) async fn send_to_lobby_client(
-    lobbies: &Lobbies,
-    lobby_id: &str,
-    client_id: &str,
-    message: Message,
-) -> bool {
-    let raw_text = match &message {
-        Message::Text(text) => Some(text.clone()),
-        _ => None,
-    };
-    let source_id = raw_text.as_deref().and_then(json_sender_id);
-    let sender_info = {
-        let lobbies_read = lobbies.read().await;
-        lobbies_read.get(lobby_id).and_then(|lobby| {
-            let target = lobby.clients.get(client_id)?;
-            let generation = source_id
-                .as_deref()
-                .and_then(|source_id| lobby.clients.get(source_id))
-                .map(|source| source.session_generation);
-            Some((
-                Arc::clone(&target.sender),
-                target.disconnect.clone(),
-                generation,
-            ))
-        })
-    };
-
-    match (sender_info, raw_text) {
-        (Some((sender, disconnect, Some(generation))), Some(text)) => {
-            let ok = send_message(
-                &sender,
-                Message::Text(inject_session_metadata(
-                    text,
-                    source_id.as_deref().unwrap_or_default(),
-                    generation,
-                )),
-            )
-            .await;
-            if !ok {
-                let _ = disconnect.send(true);
-            }
-            ok
-        }
-        (Some((sender, disconnect, _)), _) => {
-            let ok = send_message(&sender, message).await;
-            if !ok {
-                let _ = disconnect.send(true);
-            }
-            ok
-        }
-        (None, _) => false,
-    }
-}
-
-pub(crate) async fn is_current_session(
-    lobbies: &Lobbies,
-    lobby_id: &str,
-    client_id: &str,
-    session_generation: u64,
-    sender: &ClientSender,
-) -> bool {
-    let lobbies_read = lobbies.read().await;
-    lobbies_read
-        .get(lobby_id)
-        .and_then(|lobby| lobby.clients.get(client_id))
-        .map(|client| {
-            client.session_generation == session_generation && Arc::ptr_eq(&client.sender, sender)
-        })
-        .unwrap_or(false)
-}
-
-/// A lobby name identifies one room; its password is checked separately.
-pub(crate) fn generate_lobby_id(lobby_name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(lobby_name.as_bytes());
-    let result = hasher.finalize();
-    format!("{:x}", result)
-}
-
-/// 比较版本号
-/// 返回 true 如果 version >= minimum_version
-pub(crate) fn is_version_valid(version: &str, minimum_version: &str) -> bool {
-    let parse_version = |value: &str| -> Option<[u32; 3]> {
-        if value.is_empty() || value.len() > MAX_CLIENT_VERSION_LEN {
-            return None;
-        }
-        let mut parts = value.split('.');
-        let parsed = [
-            parts.next()?.parse::<u32>().ok()?,
-            parts.next()?.parse::<u32>().ok()?,
-            parts.next()?.parse::<u32>().ok()?,
-        ];
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(parsed)
-    };
-
-    matches!((parse_version(version), parse_version(minimum_version)), (Some(current), Some(minimum)) if current >= minimum)
-}
+use crate::security::*;
 
 /// 处理客户端连接
 #[allow(clippy::too_many_arguments)]
@@ -451,31 +268,35 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                 }
                             }
 
+                            let moderation_session = if is_registered {
+                                client_id.as_deref().zip(lobby_id.as_deref()).map(
+                                    |(client_id, lobby_id)| ModerationSession {
+                                        client_id,
+                                        lobby_id,
+                                        session_generation,
+                                        sender: &write,
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            match moderation::handle_moderation_message(
+                                &message,
+                                moderation_session,
+                                &lobbies,
+                                &client_lobby_map,
+                            )
+                            .await
+                            {
+                                ModerationDispatch::NotHandled => {}
+                                ModerationDispatch::Handled => continue,
+                                ModerationDispatch::CloseConnection => break,
+                            }
+
                             match message {
                                 SignalingMessage::Register { client_version, .. } => {
-                                    // Old clients show the upgrade screen only for version-too-old.
-                                    // Reject here without admitting a legacy identity to the lobby.
-                                    let version_str =
-                                        client_version.as_deref().unwrap_or("unknown");
-                                    let error_msg = if !is_version_valid(
-                                        version_str,
-                                        minimum_client_version(),
-                                    ) {
-                                        SignalingMessage::VersionTooOld {
-                                            message: format!("您的客户端版本过低（当前版本: {}），请更新到最新版本（最低要求: {}）", version_str, minimum_client_version()),
-                                            current_version: version_str.to_string(),
-                                            minimum_version: minimum_client_version().to_string(),
-                                            download_url: client_download_url().to_string(),
-                                        }
-                                    } else {
-                                        SignalingMessage::RegisterError {
-                                            message: "已拒绝旧注册协议，请先等待 server-challenge 后使用 register-v3"
-                                                .to_string(),
-                                        }
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&error_msg) {
-                                        send_text(&write, json).await;
-                                    }
+                                    registration::reject_legacy(&write, client_version.as_deref())
+                                        .await;
                                     break;
                                 }
                                 SignalingMessage::RegisterV3 {
@@ -485,505 +306,55 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                     challenge_signature,
                                     player_name,
                                     virtual_ip,
-                                    virtual_domain: _client_virtual_domain,
-                                    use_domain: _client_use_domain,
+                                    virtual_domain: _,
+                                    use_domain,
                                     lobby_name,
                                     lobby_password,
                                     client_version,
                                 } => {
-                                    if is_registered {
-                                        log::warn!(
-                                            "拒绝同一连接重复注册: peer={}, registered={:?}",
-                                            addr,
-                                            client_id
-                                        );
-                                        break;
-                                    }
-
-                                    if protocol_version != SIGNALING_PROTOCOL_VERSION {
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: format!(
-                                                "不支持的信令协议版本，要求 {}",
-                                                SIGNALING_PROTOCOL_VERSION
-                                            ),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        break;
-                                    }
-
-                                    let virtual_ip_text =
-                                        match parse_virtual_ipv4(virtual_ip.as_deref()) {
-                                            Some(ip) => ip.to_string(),
-                                            None => {
-                                                let error_msg = SignalingMessage::RegisterError {
-                                                    message: "virtualIp 必须位于 10.126.126.1-254"
-                                                        .to_string(),
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&error_msg)
-                                                {
-                                                    send_text(&write, json).await;
-                                                }
-                                                continue;
-                                            }
-                                        };
-                                    let (cid, identity_key, derived_virtual_domain) =
-                                        match verify_registration_identity(
-                                            &challenge,
-                                            &lobby_name,
-                                            &virtual_ip_text,
-                                            &identity_public_key,
-                                            &challenge_signature,
-                                        ) {
-                                            Some(identity) => identity,
-                                            None => {
-                                                let error_msg = SignalingMessage::RegisterError {
-                                                    message: "身份公钥或 challengeSignature 无效"
-                                                        .to_string(),
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&error_msg)
-                                                {
-                                                    send_text(&write, json).await;
-                                                }
-                                                break;
-                                            }
-                                        };
-                                    let chat_public_key = Some(identity_key);
-                                    // The domain is an address derived from the authenticated
-                                    // public-key fingerprint. Never accept a caller-selected name.
-                                    let virtual_domain = Some(derived_virtual_domain);
-                                    let use_domain = _client_use_domain.or(Some(true));
-
-                                    if !valid_text(&cid, MAX_CLIENT_ID_LEN, false)
-                                        || !valid_text(&player_name, MAX_PLAYER_NAME_LEN, false)
-                                        || !valid_text(&lobby_name, MAX_LOBBY_NAME_LEN, false)
-                                        || !valid_text(
-                                            &lobby_password,
-                                            MAX_LOBBY_PASSWORD_LEN,
-                                            true,
-                                        )
-                                        || virtual_domain.as_deref().is_some_and(|domain| {
-                                            !valid_text(domain, MAX_VIRTUAL_DOMAIN_LEN, true)
-                                        })
-                                    {
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: "注册字段为空、过长或包含控制字符".to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        continue;
-                                    }
-
-                                    let chat_public_key =
-                                        normalize_chat_public_key(chat_public_key);
-
-                                    log::info!("客户端注册: {} ({}) - 大厅: {} - 版本: {:?} - 虚拟IP: {:?} - 虚拟域名: {:?} - 使用域名: {:?} - 聊天公钥: {}",
-                                        player_name, cid, lobby_name, client_version, virtual_ip, virtual_domain, use_domain,
-                                        if chat_public_key.is_some() { "已提交" } else { "未提交" });
-
-                                    // 检查客户端版本
-                                    let version_str =
-                                        client_version.as_deref().unwrap_or("unknown");
-                                    if version_str == "unknown"
-                                        || !is_version_valid(version_str, minimum_client_version())
-                                    {
-                                        log::warn!("❌ 版本过低或未提供版本: {} (版本: {}) 尝试加入大厅 {}", player_name, version_str, lobby_name);
-                                        let error_msg = SignalingMessage::VersionTooOld {
-                                            message: format!("您的客户端版本过低（当前版本: {}），请更新到最新版本（最低要求: {}）", version_str, minimum_client_version()),
-                                            current_version: version_str.to_string(),
-                                            minimum_version: minimum_client_version().to_string(),
-                                            download_url: client_download_url().to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        // 等待一小段时间确保消息发送，然后强制关闭连接
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500))
-                                            .await;
-                                        log::warn!(
-                                            "🚫 强制断开版本过低的客户端连接: {} ({})",
-                                            addr,
-                                            version_str
-                                        );
-                                        break;
-                                    }
-
-                                    let virtual_ip = match parse_virtual_ipv4(virtual_ip.as_deref())
-                                    {
-                                        Some(ip) => ip,
-                                        None => {
-                                            let error_msg = SignalingMessage::RegisterError {
-                                                message: "virtualIp 必须位于 10.126.126.1-254"
-                                                    .to_string(),
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&error_msg) {
-                                                send_text(&write, json).await;
-                                            }
-                                            continue;
-                                        }
-                                    };
-
-                                    log::info!(
-                                        "✅ 版本检查通过: {} (版本: {})",
-                                        player_name,
-                                        version_str
-                                    );
-
-                                    // 生成大厅ID
-                                    let lid = generate_lobby_id(&lobby_name);
-
-                                    let mut lobbies_write = lobbies.write().await;
-                                    // Check under the same write lock as insertion: two creators
-                                    // cannot both claim a name. Do this before password checks.
-                                    let entry_error = match (entry_mode, lobbies_write.contains_key(&lid)) {
-                                        (Some(LobbyEntryMode::Create), true) => Some("大厅名称已被占用，请更换大厅名称后重试"),
-                                        (Some(LobbyEntryMode::Join), false) => Some("大厅不存在或已关闭，请检查大厅名称或联系房主"),
-                                        _ => None, // Legacy clients and explicit automatic entry.
-                                    };
-                                    if let Some(message) = entry_error {
-                                        drop(lobbies_write);
-                                        if let Ok(json) = serde_json::to_string(&SignalingMessage::RegisterError { message: message.into() }) {
-                                            send_text(&write, json).await;
-                                        }
-                                        break;
-                                    }
-                                    let existing_client_lobby = lobbies_write.iter().find_map(
-                                        |(existing_lid, existing_lobby)| {
-                                            existing_lobby
-                                                .clients
-                                                .contains_key(&cid)
-                                                .then(|| existing_lid.clone())
+                                    let outcome = registration::handle_v3(
+                                        RegistrationContext {
+                                            lobbies: &lobbies,
+                                            client_lobby_map: &client_lobby_map,
+                                            sender: &write,
+                                            disconnect_tx: &disconnect_tx,
+                                            disconnect_rx: &disconnect_rx,
+                                            challenge: &challenge,
+                                            peer_addr: addr,
+                                            source_ip,
+                                            is_registered,
+                                            client_id: client_id.as_deref(),
                                         },
-                                    );
-                                    if existing_client_lobby
-                                        .as_deref()
-                                        .is_some_and(|existing_lid| existing_lid != lid)
-                                    {
-                                        log::warn!(
-                                            "拒绝重复 clientId 注册: {} ({})",
+                                        RegistrationRequest {
+                                            entry_mode,
+                                            protocol_version,
+                                            identity_public_key,
+                                            challenge_signature,
                                             player_name,
-                                            cid
-                                        );
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: "客户端身份已在使用中，请重新连接".to_string(),
-                                        };
-                                        drop(lobbies_write);
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        // Close the duplicate session so reconnecting clients can
-                                        // retry after the previous connection finishes cleanup.
-                                        break;
-                                    }
-
-                                    // 密码失败熔断以 (来源IP, 大厅) 为键。先查锁定再比较，
-                                    // 锁定期间即使密码正确也拒绝，防止把熔断当作校验预言机。
-                                    let quota_ip = connection_guard::quota_source(source_ip);
-                                    let failure_key = (quota_ip, lid.clone());
-                                    let now = Instant::now();
-                                    let locked = {
-                                        let mut failures = register_password_failures()
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
-                                        failures.is_locked(&failure_key, now)
-                                    };
-                                    if locked {
-                                        drop(lobbies_write);
-                                        log::warn!(
-                                            "🚫 密码失败次数过多，暂时拒绝 {} 加入大厅 {}",
-                                            player_name,
-                                            lobby_name
-                                        );
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: "密码错误次数过多，请稍后再试".to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        break;
-                                    }
-
-                                    // 获取或创建大厅
-                                    if let Some(existing) = lobbies_write.get(&lid) {
-                                        let supplied_hash = hash_lobby_password(
-                                            &existing.password_salt,
-                                            &lobby_password,
-                                        );
-                                        if !ct_eq(
-                                            supplied_hash.as_bytes(),
-                                            existing.password_hash.as_bytes(),
-                                        ) {
-                                            let locked = {
-                                                let mut failures = register_password_failures()
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                if failures.is_locked(&failure_key, now) {
-                                                    true
-                                                } else {
-                                                    failures.record_failure(&failure_key, now);
-                                                    false
-                                                }
-                                            };
-                                            drop(lobbies_write);
-                                            log::warn!(
-                                                "❌ 密码错误: {} 尝试加入大厅 {}",
-                                                player_name,
-                                                lobby_name
-                                            );
-                                            let message = if locked {
-                                                "密码错误次数过多，请稍后再试".to_string()
-                                            } else {
-                                                "密码错误".to_string()
-                                            };
-                                            let error_msg =
-                                                SignalingMessage::RegisterError { message };
-                                            if let Ok(json) = serde_json::to_string(&error_msg) {
-                                                send_text(&write, json).await;
-                                            }
-                                            // 断开连接：每次猜测都必须重新握手并重新签名，
-                                            // 无法在同一连接内高速枚举大厅密码。
-                                            break;
-                                        }
-                                        register_password_failures()
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .clear(&failure_key);
-                                    }
-
-                                    let lobby =
-                                        lobbies_write.entry(lid.clone()).or_insert_with(|| {
-                                            log::info!(
-                                                "🏠 创建新大厅: {} (ID: {})，房主: {}",
-                                                lobby_name,
-                                                lid,
-                                                cid
-                                            );
-                                            let password_salt =
-                                                random_hex::<LOBBY_PASSWORD_SALT_BYTES>();
-                                            LobbyInfo {
-                                                lobby_name: lobby_name.clone(),
-                                                password_hash: hash_lobby_password(
-                                                    &password_salt,
-                                                    &lobby_password,
-                                                ),
-                                                password_salt,
-                                                clients: HashMap::new(),
-                                                host_id: cid.clone(), // 首个创建者即房主
-                                                max_players: None,
-                                                is_public: false,
-                                                is_passwordless: lobby_password.is_empty(),
-                                                description: String::new(),
-                                                server_node: String::new(),
-                                                muted: HashSet::new(),
-                                                chat_token: generate_chat_token(),
-                                                chat_token_epoch: 1,
-                                            }
-                                        });
-
-                                    // Virtual IP is the identity binding used by the chat HTTP
-                                    // service. Do not allow two members to claim the same address.
-                                    // A reconnect of the same signed identity must replace its
-                                    // stale websocket session. Checking the old record as a
-                                    // competing owner rejects every reconnect with
-                                    // "virtualIp already in use" and leaves the old HTTP/chat
-                                    // credentials bound to a dead connection.
-                                    if lobby.clients.values().any(|info| {
-                                        info.player_id != cid
-                                            && info
-                                                .virtual_ip
-                                                .as_deref()
-                                                .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
-                                                == Some(virtual_ip)
-                                    }) {
-                                        log::warn!(
-                                            "❌ 虚拟IP已在大厅 {} 中使用: {}",
-                                            lobby_name,
-                                            virtual_ip
-                                        );
-                                        drop(lobbies_write);
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: "virtualIp 已被大厅内其他成员使用".to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        continue;
-                                    }
-
-                                    // 保存客户端信息 only after all registration checks pass.
-                                    let new_session_generation = random_session_generation();
-                                    let client_info = ClientInfo {
-                                        player_id: cid.clone(),
-                                        player_name: player_name.clone(),
-                                        virtual_ip: Some(virtual_ip.to_string()),
-                                        virtual_domain: virtual_domain.clone(),
-                                        use_domain,
-                                        chat_public_key: chat_public_key.clone(),
-                                        session_generation: new_session_generation,
-                                        sender: Arc::clone(&write),
-                                        disconnect: disconnect_tx.clone(),
-                                    };
-
-                                    // 人数上限检查（房主自己创建时 clients 为空，不受影响）
-                                    if lobby.clients.len() >= MAX_LOBBY_MEMBERS
-                                        || lobby.max_players.is_some_and(|max| {
-                                            !lobby.clients.contains_key(&cid)
-                                                && lobby.clients.len() as u32 >= max
-                                        })
-                                    {
-                                        log::warn!(
-                                            "❌ 大厅 {} 已满（{}/{}），拒绝 {}",
-                                            lobby_name,
-                                            lobby.clients.len(),
-                                            lobby
-                                                .max_players
-                                                .map(|max| max as usize)
-                                                .unwrap_or(MAX_LOBBY_MEMBERS)
-                                                .min(MAX_LOBBY_MEMBERS),
-                                            player_name
-                                        );
-                                        drop(lobbies_write);
-                                        let error_msg = SignalingMessage::RegisterError {
-                                            message: format!(
-                                                "大厅人数已满（服务端上限 {} 人）",
-                                                MAX_LOBBY_MEMBERS
-                                            ),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            send_text(&write, json).await;
-                                        }
-                                        continue;
-                                    }
-
-                                    // 添加客户端到大厅。除首个成员外，每次成员加入都立即轮换
-                                    // token；新成员从 register-success 获得新 token，旧成员只
-                                    // 通过各自已认证的 WebSocket 会话收到轮换事件。
-                                    let had_existing_members = !lobby.clients.is_empty();
-                                    if let Some(previous) = lobby.clients.get(&cid) {
-                                        // Explicitly terminate the stale transport. Its delayed
-                                        // cleanup is generation/sender guarded below, so it cannot
-                                        // remove the replacement session.
-                                        let _ = previous.disconnect.send(true);
-                                    }
-                                    lobby.clients.insert(cid.clone(), client_info);
-                                    let (chat_token_now, chat_token_epoch_now) =
-                                        if had_existing_members {
-                                            rotate_chat_token(lobby)
-                                        } else {
-                                            (lobby.chat_token.clone(), lobby.chat_token_epoch)
-                                        };
-                                    let rotation_targets = if had_existing_members {
-                                        lobby
-                                            .clients
-                                            .iter()
-                                            .filter(|(id, _)| id.as_str() != cid)
-                                            .map(|(id, client)| {
-                                                (id.clone(), Arc::clone(&client.sender))
-                                            })
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let host_id_now = lobby.host_id.clone();
-                                    let max_players_now = lobby.max_players;
-                                    let is_public_now = lobby.is_public;
-                                    let muted_now: Vec<String> =
-                                        lobby.muted.iter().cloned().collect();
-                                    // Membership and client->lobby mapping are committed while the
-                                    // lobby write lock is held, so kick/disconnect cannot delete a
-                                    // freshly reconnected mapping for the same lobby.
-                                    client_lobby_map
-                                        .write()
-                                        .await
-                                        .insert(cid.clone(), lid.clone());
-                                    drop(lobbies_write);
-
-                                    client_id = Some(cid.clone());
-                                    lobby_id = Some(lid.clone());
-                                    session_generation = new_session_generation;
-                                    is_registered = true;
-
-                                    if *disconnect_rx.borrow()
-                                        || !is_current_session(
-                                            &lobbies,
-                                            &lid,
-                                            &cid,
-                                            session_generation,
-                                            &write,
-                                        )
-                                        .await
-                                    {
-                                        log::warn!(
-                                            "注册提交后会话已失效，拒绝发送 token: client={}",
-                                            cid
-                                        );
-                                        break;
-                                    }
-
-                                    log::info!(
-                                        "✅ 客户端 {} 已加入大厅 {} (当前 {} 人)",
-                                        player_name,
-                                        lobby_name,
-                                        lobbies
-                                            .read()
-                                            .await
-                                            .get(&lid)
-                                            .map(|l| l.clients.len())
-                                            .unwrap_or(0)
-                                    );
-
-                                    // 发送注册成功消息（携带房主/选项/禁言列表）
-                                    let success_msg = SignalingMessage::RegisterSuccess {
-                                        client_id: cid.clone(),
-                                        session_generation,
-                                        lobby_id: lid.clone(),
-                                        host_id: Some(host_id_now),
-                                        max_players: max_players_now,
-                                        is_public: Some(is_public_now),
-                                        muted_players: Some(muted_now),
-                                        chat_token: chat_token_now.clone(),
-                                        chat_token_epoch: chat_token_epoch_now,
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&success_msg) {
-                                        send_text(&write, json).await;
-                                    }
-
-                                    // 发送当前大厅内的玩家列表
-                                    let players = current_players(&lobbies, &lid, Some(&cid)).await;
-                                    let players_list = SignalingMessage::PlayersList { players };
-                                    if let Ok(json) = serde_json::to_string(&players_list) {
-                                        send_text(&write, json).await;
-                                    }
-
-                                    if !rotation_targets.is_empty() {
-                                        send_chat_token_rotation(
-                                            &lobbies,
-                                            rotation_targets,
-                                            lid.clone(),
-                                            chat_token_now,
-                                            chat_token_epoch_now,
-                                        )
-                                        .await;
-                                    }
-
-                                    // 通知大厅内其他客户端有新玩家加入
-                                    broadcast_to_lobby(
-                                        &lobbies,
-                                        &lid,
-                                        &cid,
-                                        SignalingMessage::PlayerJoined {
-                                            player_id: cid.clone(),
-                                            player_name: player_name.clone(),
-                                            virtual_ip: Some(virtual_ip.to_string()),
-                                            virtual_domain: virtual_domain.clone(),
+                                            virtual_ip,
                                             use_domain,
-                                            chat_public_key: chat_public_key.clone(),
-                                            session_generation,
+                                            lobby_name,
+                                            lobby_password,
+                                            client_version,
                                         },
                                     )
                                     .await;
+                                    match outcome {
+                                        RegistrationOutcome::Retry => continue,
+                                        RegistrationOutcome::Disconnect => break,
+                                        RegistrationOutcome::Committed {
+                                            session,
+                                            disconnect,
+                                        } => {
+                                            client_id = Some(session.client_id);
+                                            lobby_id = Some(session.lobby_id);
+                                            session_generation = session.generation;
+                                            is_registered = true;
+                                            if disconnect {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                                 SignalingMessage::Leave { .. } => {
                                     if is_registered {
@@ -2278,270 +1649,6 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
                                 | SignalingMessage::CommunityNodeSubmitResult { .. } => {
                                     // 服务器 -> 客户端方向的消息，客户端不应发送，忽略即可
                                 }
-                                SignalingMessage::KickPlayer { from, target } => {
-                                    if !is_registered {
-                                        log::warn!("🚫 未注册客户端尝试踢人，拒绝: {}", addr);
-                                        break;
-                                    }
-                                    let lid = match client_lobby_map.read().await.get(&from) {
-                                        Some(id) => id.clone(),
-                                        None => continue,
-                                    };
-                                    // 校验房主身份并取出目标 sender
-                                    let mut target_sender = None;
-                                    let mut target_disconnect = None;
-                                    let mut target_generation = 0u64;
-                                    let mut target_removed = false;
-                                    let mut chat_rotation = None;
-                                    {
-                                        let mut lobbies_write = lobbies.write().await;
-                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
-                                            if lobby.host_id != from {
-                                                log::warn!("🚫 非房主尝试踢人: {}", from);
-                                                continue;
-                                            }
-                                            if from == target {
-                                                continue; // 不能踢自己
-                                            }
-                                            if let Some(t) = lobby.clients.remove(&target) {
-                                                target_sender = Some(Arc::clone(&t.sender));
-                                                target_disconnect = Some(t.disconnect.clone());
-                                                target_generation = t.session_generation;
-                                                lobby.muted.remove(&target);
-                                                target_removed = true;
-                                                let (token, epoch) = rotate_chat_token(lobby);
-                                                let targets = lobby
-                                                    .clients
-                                                    .iter()
-                                                    .map(|(id, client)| {
-                                                        (id.clone(), Arc::clone(&client.sender))
-                                                    })
-                                                    .collect::<Vec<_>>();
-                                                chat_rotation = Some((targets, token, epoch));
-
-                                                let mut map = client_lobby_map.write().await;
-                                                if map
-                                                    .get(&target)
-                                                    .map(|mapped_lobby| mapped_lobby == &lid)
-                                                    .unwrap_or(false)
-                                                {
-                                                    map.remove(&target);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !target_removed {
-                                        continue;
-                                    }
-                                    if let Some(disconnect) = target_disconnect {
-                                        let _ = disconnect.send(true);
-                                    }
-                                    // 通知被踢者
-                                    if let Some(sender) = target_sender {
-                                        let kicked = SignalingMessage::Kicked {
-                                            reason: "你已被房主移出大厅".to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&kicked) {
-                                            send_text(&sender, json).await;
-                                        }
-                                        let _ = send_message(&sender, Message::Close(None)).await;
-                                    }
-                                    log::info!("👢 房主 {} 踢出了 {}", from, target);
-                                    // 广播玩家离开
-                                    broadcast_to_lobby(
-                                        &lobbies,
-                                        &lid,
-                                        &target,
-                                        SignalingMessage::PlayerLeft {
-                                            player_id: target.clone(),
-                                            session_generation: target_generation,
-                                        },
-                                    )
-                                    .await;
-                                    if let Some((targets, token, epoch)) = chat_rotation {
-                                        send_chat_token_rotation(
-                                            &lobbies,
-                                            targets,
-                                            lid.clone(),
-                                            token,
-                                            epoch,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                SignalingMessage::MutePlayer {
-                                    from,
-                                    target,
-                                    muted,
-                                } => {
-                                    if !is_registered {
-                                        log::warn!("🚫 未注册客户端尝试禁言，拒绝: {}", addr);
-                                        break;
-                                    }
-                                    let lid = match client_lobby_map.read().await.get(&from) {
-                                        Some(id) => id.clone(),
-                                        None => continue,
-                                    };
-                                    {
-                                        let mut lobbies_write = lobbies.write().await;
-                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
-                                            if lobby.host_id != from {
-                                                log::warn!("🚫 非房主尝试禁言: {}", from);
-                                                continue;
-                                            }
-                                            if target == lobby.host_id && muted {
-                                                continue;
-                                            }
-                                            if !lobby.clients.contains_key(&target) {
-                                                log::warn!(
-                                                    "🚫 房主尝试禁言不在大厅内的成员: {}",
-                                                    target
-                                                );
-                                                continue;
-                                            }
-                                            if muted {
-                                                if lobby.muted.len() >= MAX_LOBBY_MEMBERS
-                                                    && !lobby.muted.contains(&target)
-                                                {
-                                                    log::warn!("🚫 大厅禁言集合已达上限: {}", lid);
-                                                    continue;
-                                                }
-                                                lobby.muted.insert(target.clone());
-                                            } else {
-                                                lobby.muted.remove(&target);
-                                            }
-                                        }
-                                    }
-                                    log::info!("🔇 房主 {} 设置 {} 禁言={}", from, target, muted);
-                                    // 广播禁言状态给所有人（含目标本人）
-                                    broadcast_to_lobby(
-                                        &lobbies,
-                                        &lid,
-                                        "",
-                                        SignalingMessage::PlayerMuteChanged {
-                                            player_id: target,
-                                            muted,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                SignalingMessage::TransferHost { from, target } => {
-                                    if !is_registered {
-                                        log::warn!("🚫 未注册客户端尝试转让房主，拒绝: {}", addr);
-                                        break;
-                                    }
-                                    let lid = match client_lobby_map.read().await.get(&from) {
-                                        Some(id) => id.clone(),
-                                        None => continue,
-                                    };
-                                    let mut new_host: Option<String> = None;
-                                    {
-                                        let mut lobbies_write = lobbies.write().await;
-                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
-                                            if lobby.host_id != from {
-                                                log::warn!("🚫 非房主尝试转让房主: {}", from);
-                                                continue;
-                                            }
-                                            if lobby.clients.contains_key(&target) {
-                                                lobby.host_id = target.clone();
-                                                lobby.muted.remove(&target);
-                                                new_host = Some(target.clone());
-                                            }
-                                        }
-                                    }
-                                    if let Some(host_id) = new_host {
-                                        log::info!("👑 房主从 {} 转让给 {}", from, host_id);
-                                        broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
-                                            player_id: host_id.clone(), muted: false,
-                                        }).await;
-                                        broadcast_to_lobby(
-                                            &lobbies,
-                                            &lid,
-                                            "",
-                                            SignalingMessage::HostChanged { host_id },
-                                        )
-                                        .await;
-                                    }
-                                }
-                                SignalingMessage::SetLobbyOptions {
-                                    from,
-                                    max_players,
-                                    is_public,
-                                    description,
-                                    server_node,
-                                } => {
-                                    if !is_registered {
-                                        log::warn!(
-                                            "🚫 未注册客户端尝试修改大厅选项，拒绝: {}",
-                                            addr
-                                        );
-                                        break;
-                                    }
-                                    let lid = match client_lobby_map.read().await.get(&from) {
-                                        Some(id) => id.clone(),
-                                        None => continue,
-                                    };
-                                    let mut changed: Option<(Option<u32>, bool)> = None;
-                                    {
-                                        let mut lobbies_write = lobbies.write().await;
-                                        if let Some(lobby) = lobbies_write.get_mut(&lid) {
-                                            if lobby.host_id != from {
-                                                log::warn!("🚫 非房主尝试修改大厅选项: {}", from);
-                                                continue;
-                                            }
-                                            if let Some(mp) = max_players {
-                                                // 0 表示取消上限
-                                                lobby.max_players = if mp == 0 {
-                                                    None
-                                                } else {
-                                                    Some(mp.min(MAX_LOBBY_MEMBERS as u32))
-                                                };
-                                            }
-                                            if let Some(desc) = description {
-                                                if valid_text(&desc, 200, true) {
-                                                    lobby.description = desc;
-                                                }
-                                            }
-                                            // 记录房主节点（供公开广场加入者同步）
-                                            if let Some(node) = server_node {
-                                                if valid_text(&node, 512, false) {
-                                                    lobby.server_node = node;
-                                                }
-                                            }
-                                            if let Some(pubf) = is_public {
-                                                lobby.is_public = effective_public_setting(
-                                                    pubf,
-                                                    lobby.is_passwordless,
-                                                );
-                                                if pubf && !lobby.is_passwordless {
-                                                    log::warn!(
-                                                        "拒绝将有密码大厅发布到公开广场: {}",
-                                                        lobby.lobby_name
-                                                    );
-                                                }
-                                            }
-                                            changed = Some((lobby.max_players, lobby.is_public));
-                                        }
-                                    }
-                                    if let Some((mp, pubf)) = changed {
-                                        log::info!(
-                                            "⚙️ 房主 {} 更新大厅选项: max={:?}, public={}",
-                                            from,
-                                            mp,
-                                            pubf
-                                        );
-                                        broadcast_to_lobby(
-                                            &lobbies,
-                                            &lid,
-                                            "",
-                                            SignalingMessage::LobbyOptionsChanged {
-                                                max_players: mp,
-                                                is_public: pubf,
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                }
                                 _ => {
                                     log::warn!("未知消息类型");
                                 }
@@ -2658,9 +1765,16 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
 
         // 若房主已自动转移，广播房主变更
         if let Some(host_id) = new_host {
-            broadcast_to_lobby(&lobbies, &lid, "", SignalingMessage::PlayerMuteChanged {
-                player_id: host_id.clone(), muted: false,
-            }).await;
+            broadcast_to_lobby(
+                &lobbies,
+                &lid,
+                "",
+                SignalingMessage::PlayerMuteChanged {
+                    player_id: host_id.clone(),
+                    muted: false,
+                },
+            )
+            .await;
             broadcast_to_lobby(
                 &lobbies,
                 &lid,
@@ -2672,127 +1786,4 @@ pub(crate) async fn handle_connection_with_timeouts_and_limits(
     }
 
     Ok(())
-}
-
-pub(crate) async fn current_players(
-    lobbies: &Lobbies,
-    lobby_id: &str,
-    exclude_id: Option<&str>,
-) -> Vec<PlayerInfo> {
-    let lobbies_read = lobbies.read().await;
-    lobbies_read
-        .get(lobby_id)
-        .map(|lobby| {
-            lobby
-                .clients
-                .iter()
-                .filter(|(id, _)| exclude_id.is_none_or(|exclude| id.as_str() != exclude))
-                .map(|(_, info)| PlayerInfo {
-                    player_id: info.player_id.clone(),
-                    player_name: info.player_name.clone(),
-                    virtual_ip: info.virtual_ip.clone(),
-                    virtual_domain: info.virtual_domain.clone(),
-                    use_domain: info.use_domain,
-                    chat_public_key: info.chat_public_key.clone(),
-                    session_generation: info.session_generation,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 广播消息到大厅内所有客户端（排除指定客户端）
-pub(crate) async fn broadcast_to_lobby(
-    lobbies: &Lobbies,
-    lobby_id: &str,
-    exclude_id: &str,
-    message: SignalingMessage,
-) {
-    if let Ok(json) = serde_json::to_string(&message) {
-        let source_id = json_sender_id(&json);
-        let (senders, generation) = {
-            let lobbies_read = lobbies.read().await;
-            let Some(lobby) = lobbies_read.get(lobby_id) else {
-                return;
-            };
-            let generation = source_id
-                .as_deref()
-                .and_then(|source_id| lobby.clients.get(source_id))
-                .map(|source| source.session_generation);
-            let senders = lobby
-                .clients
-                .iter()
-                .filter(|(id, _)| id.as_str() != exclude_id)
-                .map(|(_, client)| (Arc::clone(&client.sender), client.disconnect.clone()))
-                .collect::<Vec<_>>();
-            (senders, generation)
-        };
-        let json = generation
-            .zip(source_id.as_deref())
-            .map(|(generation, source_id)| {
-                inject_session_metadata(json.clone(), source_id, generation)
-            })
-            .unwrap_or(json);
-        // 只在锁内复制发送端句柄；实际网络写入全部在锁外执行。
-        let sends = senders.into_iter().map(|(sender, disconnect)| {
-            let message = Message::Text(json.clone());
-            async move {
-                let ok = send_message(&sender, message).await;
-                if !ok {
-                    let _ = disconnect.send(true);
-                }
-                ok
-            }
-        });
-        let _ = join_all(sends).await;
-    }
-}
-
-pub(crate) async fn send_chat_token_rotation(
-    lobbies: &Lobbies,
-    targets: Vec<(String, ClientSender)>,
-    lobby_id: String,
-    chat_token: String,
-    chat_token_epoch: u64,
-) {
-    let senders = {
-        let lobbies_read = lobbies.read().await;
-        let Some(lobby) = lobbies_read.get(&lobby_id) else {
-            return;
-        };
-        // A newer membership change supersedes this notification. Dropping
-        // stale epochs here prevents old tokens from arriving after new ones.
-        if lobby.chat_token_epoch != chat_token_epoch || lobby.chat_token != chat_token {
-            return;
-        }
-        targets
-            .into_iter()
-            .filter_map(|(client_id, sender)| {
-                lobby
-                    .clients
-                    .get(&client_id)
-                    .filter(|client| Arc::ptr_eq(&client.sender, &sender))
-                    .map(|client| (sender, client.disconnect.clone()))
-            })
-            .collect::<Vec<_>>()
-    };
-    let message = SignalingMessage::ChatTokenRotated {
-        lobby_id,
-        chat_token,
-        chat_token_epoch,
-    };
-    let Ok(json) = serde_json::to_string(&message) else {
-        return;
-    };
-    let sends = senders.into_iter().map(|(sender, disconnect)| {
-        let json = json.clone();
-        async move {
-            let ok = send_text(&sender, json).await;
-            if !ok {
-                let _ = disconnect.send(true);
-            }
-            ok
-        }
-    });
-    let _ = join_all(sends).await;
 }

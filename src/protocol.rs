@@ -3,7 +3,11 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum LobbyEntryMode { Create, Join, Auto }
+pub enum LobbyEntryMode {
+    Create,
+    Join,
+    Auto,
+}
 
 /// WebSocket 信令消息
 #[derive(Debug, Clone, Serialize, Deserialize)]

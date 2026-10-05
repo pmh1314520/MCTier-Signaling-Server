@@ -2,6 +2,7 @@
 use super::*;
 #[cfg(not(test))]
 use crate::state::*;
+use std::sync::OnceLock;
 
 // ==================== 用户投稿的共享节点 ====================
 
@@ -207,15 +208,7 @@ pub(crate) fn probe_allows_private_targets() -> bool {
     }
     #[cfg(not(test))]
     {
-        static CELL: OnceLock<bool> = OnceLock::new();
-        *CELL.get_or_init(|| {
-            matches!(
-                env_or("COMMUNITY_NODE_ALLOW_PRIVATE_TARGETS", "false")
-                    .to_lowercase()
-                    .as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        super::server_config().community_node_allow_private_targets
     }
 }
 

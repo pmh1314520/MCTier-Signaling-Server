@@ -37,7 +37,7 @@ P2P 通道，因此服务器带宽占用很低，1 核 512MB 的小机器即可�
 
 ## 快速开始
 
-升级注意：新版客户端要求 `server-challenge` 携带 `lobbyEntryModes: true`。请先部署本次服务端更新，再发布配套客户端；否则客户端会明确提示联系管理员升级信令服务器。旧客户端仍可连接新版服务端。
+升级注意：新版客户端要求 `server-challenge` 携带 `lobbyEntryModes: true`。请先部署本次服务端更新，再发布配套客户端；否则客户端会明确提示联系管理员升级信令服务器。未传 `entryMode` 的协议 v3 客户端仍保留自动大厅行为；使用旧 `register` 协议的客户端会被拒绝并提示升级。
 
 ### 一键部署（推荐）
 
@@ -218,32 +218,60 @@ wss://mctiers.pmhs.top
 
 ## 本地开发
 
-需要 Rust 1.83 或更高版本。
+需要 Rust 1.85 或更高版本。Docker 构建固定使用 Rust 1.85.0；
+锁定依赖 `zeroize 1.9.0` 和 `base64ct 1.8.3` 的最低 Rust 版本为 1.85。
 
 ```bash
 # 检查编译
-cargo check
+cargo check --locked
+
+# 格式与回归测试
+cargo fmt --all -- --check
+cargo test --locked
 
 # 本地运行（可用环境变量覆盖配置）
 RUST_LOG=debug BIND_ADDRESS=127.0.0.1:8445 cargo run
 
 # 构建发布版本
-cargo build --release
+cargo build --locked --release
 ```
 
 编译产物在 `target/release/mctier-signaling-server`。
 
+### 模块边界
+
+| 模块 | 维护职责 |
+| --- | --- |
+| `config.rs` | 进程配置、默认值与资源边界 |
+| `connection_guard.rs` | 握手、连接额度与可信代理来源解析 |
+| `protocol.rs` | 消息类型、字段边界与玩家列表数据 |
+| `security.rs` | 身份签名、密码校验与注册失败限流 |
+| `state.rs` | 大厅、会话、共享状态与令牌轮换 |
+| `transport.rs` | 有界发送、同大厅广播与当前会话检查 |
+| `registration.rs` | legacy 拒绝、v3 校验、原子准入与成员通知 |
+| `moderation.rs` | 房主授权、踢人、禁言、转让与大厅选项 |
+| `connection.rs` | 连接生命周期、认证、消息分发与断线清理 |
+| `community_nodes.rs` | 共享节点探测、持久化与巡检 |
+| `main.rs` | 启动 wiring 与跨模块集成测试 |
+
+锁顺序、注册结果的清理所有权、事件顺序和测试要求见
+[架构维护指南](docs/architecture.md)。后续拆分应按业务边界逐步迁移，而不是只移动大段代码或改变现有消息格式。
+
 ## 信令协议
 
-所有消息都是 JSON 文本帧，用 `type` 字段区分类型。客户端连接后必须先发送 `register`，
-在收到 `register-success` 之前发送的其他信令都会被拒绝。
+所有消息都是 JSON 文本帧，用 `type` 字段区分类型。连接建立后，服务器先下发
+`server-challenge`；客户端使用身份公钥对挑战、大厅名和虚拟 IP 签名，再发送
+`register-v3`。旧 `register` 仅用于返回明确的迁移错误，不会创建成员会话。
+在收到 `register-success` 前不能发送大厅内信令；心跳、公开大厅查询和共享节点查询/投稿允许未注册连接使用，仍受连接及消息限流约束。
 
 ### 连接与大厅
 
 | 消息类型 | 方向 | 说明 |
 | --- | --- | --- |
-| `register` | 客户端 → 服务器 | 携带 `clientId`、`playerName`、`lobbyName`、`lobbyPassword`、`clientVersion` |
-| `register-success` | 服务器 → 客户端 | 返回 `lobbyId`、`hostId`、`maxPlayers`、`isPublic`、`mutedPlayers` |
+| `server-challenge` | 服务器 → 客户端 | 返回一次性 `challenge`、`protocolVersion`、`lobbyEntryModes` |
+| `register-v3` | 客户端 → 服务器 | 携带 `identityPublicKey`、`challengeSignature`、`protocolVersion`、玩家/大厅/版本信息及可选 `entryMode`；`clientId` 与域名由服务端派生 |
+| `register` | 客户端 → 服务器 | 旧协议，仅返回升级或迁移错误并断开 |
+| `register-success` | 服务器 → 客户端 | 返回派生 `clientId`、`sessionGeneration`、大厅/房主/选项和当前 `chatToken`、`chatTokenEpoch` |
 | `register-error` | 服务器 → 客户端 | 注册失败原因（大厅人数已满、旧版本字段缺失等） |
 | `version-too-old` | 服务器 → 客户端 | 版本过低，附带 `minimumVersion` 和 `downloadUrl` |
 | `players-list` | 服务器 → 客户端 | 当前大厅玩家列表 |

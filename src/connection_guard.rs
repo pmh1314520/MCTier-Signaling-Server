@@ -226,22 +226,19 @@ impl Admission {
     }
 }
 
+#[cfg(test)]
 fn source_limit_from_env(value: Option<&str>) -> Option<usize> {
-    value
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
+    super::positive_limit_from_env(value)
 }
 
 pub fn admission() -> &'static Admission {
     static VALUE: OnceLock<Admission> = OnceLock::new();
     VALUE.get_or_init(|| {
-        let max = super::max_connections();
-        let limit =
-            source_limit_from_env(std::env::var("MAX_CONNECTIONS_PER_SOURCE").ok().as_deref());
+        let config = super::server_config();
         Admission::new(
-            max,
-            limit,
-            &std::env::var("TRUSTED_PROXIES").unwrap_or_default(),
+            config.max_connections,
+            config.max_connections_per_source,
+            &config.trusted_proxies,
         )
         .expect("invalid connection admission configuration")
     })
