@@ -618,6 +618,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_host_action_rechecks_session_after_lock_contention() {
+        for message in [
+            SignalingMessage::KickPlayer {
+                from: HOST_ID.to_string(),
+                target: MEMBER_ID.to_string(),
+            },
+            SignalingMessage::MutePlayer {
+                from: HOST_ID.to_string(),
+                target: MEMBER_ID.to_string(),
+                muted: true,
+            },
+            SignalingMessage::TransferHost {
+                from: HOST_ID.to_string(),
+                target: MEMBER_ID.to_string(),
+            },
+        ] {
+            let fixture = Fixture::new(true).await;
+            let mut guard = fixture.lobbies.write().await;
+            let mut action = std::pin::pin!(fixture.host_action(&message));
+            // Poll until the handler has reached the contended lobby lock.
+            // No sleep or scheduler timing is used to establish the race.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(action.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            guard
+                .get_mut(LOBBY_ID)
+                .unwrap()
+                .clients
+                .get_mut(HOST_ID)
+                .unwrap()
+                .session_generation = 99;
+            drop(guard);
+            assert_eq!(action.await, ModerationDispatch::CloseConnection);
+            fixture.assert_unchanged().await;
+        }
+    }
+
+    #[tokio::test]
     async fn sender_and_lobby_mapping_must_match_the_authenticated_context() {
         let fixture = Fixture::new(true).await;
         assert_eq!(

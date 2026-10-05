@@ -29,10 +29,6 @@ logs/
 # 编辑器与系统文件
 # Keep all dot-prefixed directories local at every depth.
 **/.*/
-# GitHub Actions workflow definitions are repository source.
-!/.github/
-!/.github/workflows/
-!/.github/workflows/*.yml
 .vscode/
 .idea/
 *.swp

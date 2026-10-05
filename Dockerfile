@@ -1,7 +1,7 @@
 # MCTier 信令服务器 Docker 镜像
 # 基于 Rust 官方镜像构建
 
-# 构建阶段 - 与 CI 使用同一固定工具链，满足锁定依赖的 Rust 1.85 最低要求
+# 构建阶段 - 固定工具链，满足锁定依赖的 Rust 1.85 最低要求
 FROM rust:1.85.0-slim as builder
 
 # 安装必要的构建工具
