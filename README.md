@@ -432,3 +432,7 @@ curl -i -N \
 - Gitee：https://gitee.com/peng-minghang/mctier
 
 最低版本默认值现为 `3.8.0`。已有部署若在 `.env` 或云端环境变量中设置了 `MINIMUM_CLIENT_VERSION`，请同步设为 `3.8.0` 并重新创建容器；仅更新源码不会覆盖已有环境变量。
+
+## GitHub 自动检查
+
+`.github/workflows/ci.yml` 在推送和 PR 时使用 Rust 1.85.0 执行格式检查、锁定依赖的编译检查和测试。工作流只读取仓库，不部署服务器。仅此审核过的 `.github` 配置作为点目录排除规则的例外；其他本地目录仍不提交。

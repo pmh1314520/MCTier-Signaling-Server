@@ -27,7 +27,7 @@ letsencrypt/
 logs/
 
 # 编辑器与系统文件
-# Keep all dot-prefixed directories local at every depth.
+# Keep dot-prefixed directories local except the reviewed allowlist below.
 **/.*/
 .vscode/
 .idea/
@@ -55,3 +55,11 @@ community_nodes.json.tmp
 *.partial
 *.jks
 *.keystore
+
+
+# Reviewed GitHub configuration is the only dot-directory exception.
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/ci.yml

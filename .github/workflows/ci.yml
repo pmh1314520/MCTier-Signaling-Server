@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust 1.85 format, check and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install supported toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt --no-self-update
+      - name: Check formatting
+        run: cargo +1.85.0 fmt --all -- --check
+      - name: Check compilation
+        run: cargo +1.85.0 check --locked --all-targets
+      - name: Run unit and integration tests
+        run: cargo +1.85.0 test --locked --all-targets -- --test-threads=1
